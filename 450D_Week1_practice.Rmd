@@ -1,0 +1,448 @@
+---
+title: "POLISCI450D Week1 Practice"
+subtitle: "Modern Difference-in-Differences"
+author: "Rabia Kutlu Karasu"
+format:
+  html:
+    toc: true
+    code-fold: false
+    embed-resources: true
+jupyter: r
+---
+
+## Introduction
+
+We will replicate two papers using the **fect** package for counterfactual estimation in panel data today:
+
+1. **Hainmueller and Hangartner (2019)**: Examining the effects of indirect versus direct democracy on naturalization rates in Switzerland (staggered adoption design **without treatment reversals**)
+2. **Grumbach and Sahn (2020)**: Investigating the mobilizing effect of minority candidates on coethnic support in U.S. congressional elections (design **with treatment reversals**)
+
+For additional practice, Yan (2025) (on the syllabus) offers another useful application. I have the replication files and am happy to share them with anyone who would like to practice further and sharpen their skills.
+
+The **fect** package implements counterfactual (imputation) estimators for causal inference with time-series cross-sectional data. These methods address limitations of traditional two-way fixed effects (TWFE) models when dealing with heterogeneous treatment effects and staggered adoption.
+
+
+### Installing Required Packages
+
+First, install the necessary packages from CRAN and GitHub:
+
+
+```{r install-packages, eval=FALSE}
+rm(list = ls())
+devtools::install_github("xuyiqing/fect")
+installed.packages()["fect", "Version"]
+devtools::install_github('xuyiqing/panelView')
+install_all <- function(packages) {
+  installed_pkgs <- installed.packages()[, "Package"]
+  for (pkg in packages) {
+    if (!pkg %in% installed_pkgs) {
+      install.packages(pkg)
+    }
+  }
+}
+if (!"HonestDiDFEct" %in% rownames(installed.packages())) {
+  devtools::install_github("lzy318/HonestDiDFEct")
+}
+
+packages <- c("abind", "doParallel", "doRNG", "fixest", "foreach", "future", 
+              "GGally", "ggplot2", "grid", "gridExtra", "Mass", 
+              "panelView", "Rcpp")
+install_all(packages)
+
+packages <- c("dplyr", "fixest", "did", "didimputation", 
+              "panelView", "ggplot2", "bacondecomp", "HonestDiD",
+              "DIDmultiplegtDYN", "PanelMatch","patchwork")
+install.packages(setdiff(packages, rownames(installed.packages())))  
+
+```
+
+### Loading Libraries
+
+```{r load-libraries, message=FALSE, warning=FALSE}
+
+library(dplyr)
+library(readstata13)
+library(fixest)
+library(did)
+library(fect)
+library(panelView)
+library(PanelMatch)
+library(ggplot2)
+library(bacondecomp)
+library(fect)
+library(didimputation)
+library(doParallel)
+library(HonestDiD)
+library(HonestDiDFEct)
+library(patchwork)
+
+```
+
+### Loading Datasets
+
+The **fect** package includes built-in datasets for both examples:
+
+```{r load-data}
+data(fect)
+ls()  # Lists available datasets
+
+# View the first few rows of each dataset
+head(hh2019) #Hainmueller and Hangartner (2019) data
+head(gs2020) #Grumbach and Sahn (2020) data
+```
+
+## Example 1: Hainmueller and Hangartner (2019)
+
+### Research Question
+
+Does switching from direct democracy to indirect democracy increase naturalization rates for minority immigrants in Swiss municipalities?
+
+### Data Structure
+
+The `hh2019` dataset contains:
+- **bfs**: Municipality identifier
+- **year**: Time period (1991-2009)
+- **nat_rate_ord**: Naturalization rate (outcome variable)
+- **indirect**: Treatment indicator (1 = indirect democracy, 0 = direct democracy)
+
+
+### Visualizing Treatment Status
+
+This is a staggered adoption design where different municipalities switch from direct to indirect democracy at different times, with no treatment reversals.
+
+```{r hh-treatment-viz, fig.width=8, fig.height=6}
+panelview(nat_rate_ord ~ indirect, 
+          data = hh2019, 
+          index = c("bfs", "year"),
+          axis.lab = "time",
+          xlab = "Year", 
+          ylab = "Municipality",
+          gridOff = TRUE,
+          by.timing = TRUE,
+          background = "white",
+          main = "Hainmueller & Hangartner (2019): Treatment Status")
+```
+
+### Visualizing Outcome Variable
+
+```{r hh-outcome-viz, fig.width=8, fig.height=6}
+panelview(nat_rate_ord ~ indirect, 
+          data = hh2019, 
+          index = c("bfs", "year"),
+          type = "outcome",
+          xlab = "Year", 
+          ylab = "Municipality",
+          main = "Hainmueller & Hangartner (2019): Naturalization Rates")
+```
+
+### Estimating Treatment Effects
+
+We use the Fixed Effects Counterfactual estimator (FEct), which is equivalent to the "imputation method" or "two-stage DID":
+
+```{r hh-fect-estimation}
+# Estimate with FEct method
+out.hh <- fect(nat_rate_ord ~ indirect, 
+               data = hh2019, 
+               index = c("bfs", "year"),
+               method = "fe",           # Fixed effects counterfactual
+               force = "two-way",       # Two-way fixed effects
+               se = TRUE,               # Calculate standard errors
+               vartype = "bootstrap",   # Bootstrap inference
+               nboots = 200,            # Number of bootstrap iterations
+               parallel = TRUE)         # Use parallel computing
+
+# View summary
+print(out.hh)
+```
+
+### Visualizing Results: Gap Plot
+
+The gap plot shows estimated dynamic treatment effects (ATT) over time:
+
+```{r hh-gap-plot, fig.width=10, fig.height=6}
+plot(out.hh, 
+     type = "gap",
+     main = "Hainmueller & Hangartner (2019): Dynamic Treatment Effects",
+     ylab = "Effect on Naturalization Rate",
+     xlab = "Time Relative to Treatment")
+```
+
+### Visualizing Results: Counterfactual Plot
+
+The counterfactual plot shows the observed outcomes for treated units versus the predicted counterfactual (what would have happened without treatment):
+
+```{r hh-counterfactual-plot, fig.width=10, fig.height=6}
+plot(out.hh, 
+     type = "counterfactual",
+     main = "Hainmueller & Hangartner (2019): Treated vs. Counterfactuals",
+     ylab = "Naturalization Rate",
+     legend.pos = "bottom")
+```
+
+### Diagnostic Tests
+
+Conduct placebo tests to validate the parallel trends assumption:
+
+```{r hh-placebo-test}
+# Run placebo test using 3 pre-treatment periods
+out.hh.placebo <- fect(nat_rate_ord ~ indirect, 
+                       data = hh2019, 
+                       index = c("bfs", "year"),
+                       method = "fe",
+                       force = "two-way",
+                       se = TRUE,
+                       vartype = "bootstrap",
+                       nboots = 200,
+                       placeboTest = TRUE,
+                       placebo.period = c(-3, -1))  # Use periods -3 to -1 as placebo
+
+# Visualize placebo test results
+plot(out.hh.placebo, 
+     type = "gap",
+     main = "Placebo Test: Hainmueller & Hangartner (2019)")
+```
+
+### Interpretation
+
+Based on the analysis:
+
+1. **Main Finding**: Switching from direct to indirect democracy increased naturalization rates by approximately 1.2-1.7 percentage points on average
+2. **Dynamic Effects**: The treatment effect persists and may strengthen over time
+3. **Parallel Trends**: Placebo tests should show no significant pre-treatment effects, supporting the identifying assumptions
+
+
+
+## Example 2: Grumbach and Sahn (2020)
+
+### Research Question
+
+Does the presence of an Asian candidate mobilize coethnic support (measured by the proportion of campaign contributions from Asian donors) in U.S. congressional elections?
+
+### Data Structure
+
+The `gs2020` dataset contains:
+- **district**: Congressional district identifier
+- **cycle**: Election cycle (time period)
+- **pct_asian_gen**: Proportion of contributions from Asian donors (outcome)
+- **asian_cand**: Presence of Asian candidate (treatment indicator)
+
+This design includes **treatment reversals**, where districts can have Asian candidates in some elections but not others.
+
+### Visualizing Treatment Status
+
+```{r gs-treatment-viz, fig.width=8, fig.height=6}
+
+panelview(Y="general_sharetotal_A_all", D="cand_A_all",
+          X=c("cand_H_all", "cand_B_all"), 
+          index = c("district_final", "cycle"),
+          data = gs2020, 
+          xlab = "Time Period", ylab = "District",
+          gridOff = TRUE, 
+          by.timing = TRUE,
+          cex.legend=5, cex.axis= 5, 
+          cex.main = 10, cex.lab = 5,
+          main = "Grumbach & Sahn (2020): Treatment Status (Asian Candidate Presence)")
+```
+
+### Visualizing Outcome Variable
+
+```{r gs-outcome-viz, fig.width=8, fig.height=6}
+panelview(general_sharetotal_A_all ~ cand_A_all, 
+          data = gs2020, 
+          index = c("district_final", "cycle"),
+          type = "outcome",
+          xlab = "Election Cycle", 
+          ylab = "District",
+          main = "Grumbach & Sahn (2020): Proportion of Asian Donations")
+```
+
+### Estimating Treatment Effects with Treatment Reversals
+
+The FEct method can accommodate treatment reversals under the assumption of limited carryover effects:
+
+```{r gs-fect-estimation}
+# Estimate with FEct method
+out.gs <- fect(general_sharetotal_A_all ~ cand_A_all, 
+               data = gs2020, 
+               index = c("district_final", "cycle"),
+               method = "fe",
+               force = "two-way",
+               se = TRUE,
+               vartype = "bootstrap",
+               nboots = 200,
+               parallel = TRUE)
+
+# View summary
+print(out.gs)
+```
+
+### Visualizing Results: Gap Plot
+
+```{r gs-gap-plot, fig.width=10, fig.height=6}
+plot(out.gs, 
+     type = "gap",
+     main = "Grumbach & Sahn (2020): Dynamic Treatment Effects",
+     ylab = "Effect on Asian Donor Proportion",
+     xlab = "Time Relative to Treatment")
+```
+
+### Visualizing Results: Counterfactual Plot
+
+```{r gs-counterfactual-plot, fig.width=10, fig.height=6}
+plot(out.gs, 
+     type = "counterfactual",
+     main = "Grumbach & Sahn (2020): Treated vs. Counterfactuals",
+     ylab = "Proportion of Asian Donations",
+     legend.pos = "bottom")
+```
+
+### Testing for Carryover Effects
+
+When treatment reverses, we should test whether effects persist after treatment ends:
+
+```{r gs-carryover-test}
+# Run carryover test
+out.gs.carryover <- fect(general_sharetotal_A_all ~ cand_A_all, 
+                         data = gs2020, 
+                         index = c("district_final", "cycle"),
+                         method = "fe",
+                         force = "two-way",
+                         se = TRUE,
+                         vartype = "bootstrap",
+                         nboots = 200,
+                         carryoverTest = TRUE,
+                         carryover.period = c(1, 3))  # Test 1-3 periods after treatment ends
+
+# Visualize carryover test
+plot(out.gs.carryover, 
+     type = "exit",
+     main = "Carryover Effects Test: Grumbach & Sahn (2020)")
+```
+So, limited evidence of carryover effects suggests the treatment effect is contemporaneous.
+
+
+## Sensitivity Analysis
+
+Following Rambachan and Roth (2023), we can assess sensitivity to potential parallel trends violations:
+
+```{r sensitivity-analysis}
+# Run fect with placebo periods
+out.fect.placebo <- fect(nat_rate_ord~indirect, data = hh2019, 
+                         index = c("bfs","year"),
+                         method = 'fe', se = TRUE, 
+                         placeboTest = TRUE, placebo.period = c(-2,0))
+
+# Define post-treatment periods and sensitivity parameters for fect_sens
+T.post <- 10 # Number of post-treatment periods based on original analysis
+post_periods_vec <- 1:T.post
+
+# Parameters for Relative Magnitude (RM) restriction
+Mbar_vec_avg_rm <- seq(0, 1, by = 0.1)    # For average ATT plot
+Mbar_vec_period_rm <- c(0, 0.5)          # For period-by-period ATT plot
+
+# Parameters for Smoothness restriction
+M_vec_avg_smooth <- seq(0, 0.25, by = 0.05) # For average ATT plot
+M_vec_period_smooth <- c(0, 0.1)           # For period-by-period ATT plot
+
+# Run sensitivity analysis using fect_sens
+# This function augments out.fect.placebo with sensitivity results
+out.fect.placebo <- fect_sens(
+  fect.out      = out.fect.placebo,
+  post.periods  = post_periods_vec,
+  Mbarvec       = Mbar_vec_avg_rm,
+  periodMbarvec = Mbar_vec_period_rm,
+  Mvec          = M_vec_avg_smooth,
+  periodMvec    = M_vec_period_smooth,
+  parallel      = TRUE # Set to TRUE for parallel processing if desired
+)
+
+plot(out.fect.placebo,
+     type = "sens",
+     restrict = "rm",
+     main = "Sensitivity Analysis: Relative Magnitude Restriction")
+
+```
+
+## Comparing with Other Modern DID Estimators
+
+The **fect** package provides a wrapper function to compare multiple estimators:
+
+```{r did-wrapper, warning=FALSE, message=FALSE}
+
+# Compare multiple estimators
+res_twfe_es <- did_wrapper(
+  data   = hh2019,
+  Y      = "nat_rate_ord",
+  D      = "indirect",
+  index  = c("bfs", "year"),
+  method = "twfe",
+  se     = "default"
+)
+
+res_stacked_es <- did_wrapper(
+  data   = hh2019,
+  Y      = "nat_rate_ord",
+  D      = "indirect",
+  index  = c("bfs", "year"),
+  method = "st",
+  se     = "default"
+)
+
+res_stacked_es_b <- did_wrapper(
+  data   = hh2019,
+  Y      = "nat_rate_ord",
+  D      = "indirect",
+  index  = c("bfs", "year"),
+  method = "st",
+  se     = "boot"
+)
+
+res_iw_es <- did_wrapper(
+  data   = hh2019,
+  Y      = "nat_rate_ord",
+  D      = "indirect",
+  index  = c("bfs", "year"),
+  method = "iw",
+  se     = "default"
+)
+
+p_twfe<- esplot(res_twfe_es, main="",xlab="")
+p_stacked<- esplot(res_stacked_es, main="",xlab="")
+p_stacked_b <- esplot(res_stacked_es_b, main="",xlab="")
+p_iw<- esplot(res_iw_es, main="",xlab="")
+
+
+(p_twfe | p_stacked | p_iw) +
+  plot_annotation(
+    title = "Event Study Comparison Across DID Estimators",
+    subtitle = "Same data, same event time — different estimators",
+    caption = "TWFE, Stacked DID, and Interaction-Weighted estimators"
+  )
+
+(p_stacked_b|p_stacked)+
+  plot_annotation(
+    title = "Stacked DID",
+    caption = "Stacked DID with and without bootstrapped standard errors."
+  )
+```
+
+
+## References
+
+- Chiu, A., Lan, X., Liu, Z., & Xu, Y. (2025). Causal Panel Analysis Under Parallel Trends: Lessons from a Large Reanalysis Study. *American Political Science Review*.
+
+- Grumbach, J. M., & Sahn, A. (2020). Race and Representation in Campaign Finance. *American Political Science Review*, 114(1), 206-221.
+
+- Hainmueller, J., & Hangartner, D. (2019). Does Direct Democracy Hurt Immigrant Minorities? Evidence from Naturalization Decisions in Switzerland. *American Journal of Political Science*, 63(3), 530-547.
+
+- Liu, L., Wang, Y., & Xu, Y. (2024). A Practical Guide to Counterfactual Estimators for Causal Inference with Time-Series Cross-Sectional Data. *American Journal of Political Science*, 68(1), 160-176.
+
+- Rambachan, A., & Roth, J. (2023). A More Credible Approach to Parallel Trends. *Review of Economic Studies*, rdad018.
+
+- Xu, Y. (2017). Generalized Synthetic Control Method: Causal Inference with Interactive Fixed Effects Models. *Political Analysis*, 25(1), 57-76.
+
+## Additional Resources
+
+- **fect package documentation**: https://yiqingxu.org/packages/fect
+- **GitHub repository**: https://github.com/xuyiqing/fect
+- **panelView package**: https://github.com/xuyiqing/panelView

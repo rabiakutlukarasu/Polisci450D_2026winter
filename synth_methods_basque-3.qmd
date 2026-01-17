@@ -1,0 +1,735 @@
+---
+title: "Synthetic Control Methods: The Economic Costs of Conflict"
+subtitle: "Replication and Modern Extensions"
+author: "Rabia Kutlu Karasu"
+format:
+  html:
+    toc: true
+    embed-resources: true
+    toc-depth: 3
+    code-fold: show
+    theme: cosmo
+    highlight-style: github
+    type: book
+    output-dir: docs
+execute:
+  warning: false
+  message: false
+website:
+  site-url: "https://github.com/rabiakutlukarasu/Polisci450D_2026winter.git"
+---
+
+# Introduction
+
+This chapter replicates the seminal synthetic control analysis from **Abadie and Gardeazabal (2003)** examining the economic impact of terrorism in the Basque Country, then extends the analysis using modern methods:
+
+- **Generalized Synthetic Control (GSynth)** (Xu 2017) - Interactive fixed effects model
+- **Synthetic Difference-in-Differences** (Arkhangelsky et al. 2021)
+- **Augmented Synthetic Control** (Ben-Michael, Feller, and Rothstein 2021)  
+- **Triply Robust Panel Estimators** (Athey et al. 2025)
+
+## The Research Question
+
+During the late 1960s and 1970s, the Basque terrorist organization ETA (Euskadi Ta Askatasuna) intensified its violent campaign for independence from Spain. **Did this conflict reduce economic growth in the Basque Country?**
+
+## Why Synthetic Control?
+
+Traditional difference-in-differences requires parallel trends - but what if no single control region provides a good comparison? The Basque Country has unique characteristics:
+
+- Industrial economy
+- Cultural distinctiveness  
+- Geographic location
+- Political history
+
+**Solution**: Create a "synthetic" Basque Country as a weighted combination of other Spanish regions that resembles pre-terrorism Basque Country on economic indicators.
+
+
+## Setup and Data
+
+
+```{r setup}
+# Load required packages
+library(Synth)           # Original synthetic control
+library(tidyverse)      
+library(fect)            # Generalized synthetic control (Xu 2017)
+library(synthdid)        # Synthetic DiD (Arkhangelsky et al. 2021)
+library(augsynth)        # Augmented synthetic control (Ben-Michael et al. 2021)
+library(knitr)        
+library(kableExtra)     
+library(patchwork)  
+library(panelView)
+
+# Set theme for all plots
+theme_set(theme_bw(base_size = 12) +
+          theme(plot.title = element_text(face = "bold", size = 14),
+                plot.subtitle = element_text(size = 11),
+                legend.position = "bottom"))
+```
+
+
+```{r load-data}
+# Load the Basque Country data (built into Synth package)
+data("basque")
+
+# Examine the data structure
+glimpse(basque)
+
+# Create a summary table of the data
+basque %>%
+  group_by(regionname) %>%
+  summarise(
+    years = paste(min(year), "-", max(year)),
+    n_obs = n(),
+    avg_gdp = round(mean(gdpcap, na.rm = TRUE), 0)
+  ) %>%
+  head(10) %>%
+  kable(
+    col.names = c("Region", "Years", "Observations", "Avg GDP per Capita"),
+    caption = "Sample of Spanish Regional Panel Data"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+The dataset includes:
+- **17 Spanish regions** (excluding aggregate Spain)
+- **Time period**: 1955-1997
+- **Variables**: 
+  - GDP per capita (outcome)
+  - Education levels (predictors)
+  - Sector composition (predictors)
+  - Investment rates (predictor)
+  
+  
+## Visualizing the Problem
+
+```{r viz-raw-trends, fig.width=10, fig.height=6}
+# Plot GDP trends for Basque Country vs other regions
+basque %>%
+  mutate(
+    region_type = case_when(
+      regionname == "Basque Country (Pais Vasco)" ~ "Basque Country",
+      regionname == "Spain (Espana)" ~ "Spain (aggregate)",
+      TRUE ~ "Other regions"
+    )
+  ) %>%
+  ggplot(aes(x = year, y = gdpcap, group = regionname, color = region_type)) +
+  geom_line(alpha = 0.6, linewidth = 0.8) +
+  geom_vline(xintercept = 1975, linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text", x = 1975, y = max(basque$gdpcap, na.rm = TRUE), 
+           label = "Death of Franco (1975)\nIntensification of terrorism", 
+           hjust = -0.05, vjust = 1, size = 3.5) +
+  scale_color_manual(values = c("Basque Country" = "#D55E00", 
+                                 "Spain (aggregate)" = "#0072B2",
+                                 "Other regions" = "gray70"),
+                     name = "") +
+  labs(
+    title = "GDP per Capita: Basque Country vs Spanish Regions",
+    subtitle = "Raw data shows divergence after 1975, but which regions are comparable?",
+    x = "Year",
+    y = "GDP per Capita (thousands of pesetas)",
+    caption = "Source: Abadie & Gardeazabal (2003)"
+  ) +
+  theme(legend.position = "top")
+```
+
+After 1975, the Basque Country's GDP per capita trajectory appears to diverge from other regions.
+
+
+# Part 1: Classic Synthetic Control Method
+
+## Preparing the Data
+
+The `Synth` package requires data in a specific format using the `dataprep()` function:
+
+```{r dataprep}
+# Prepare data for Synth package
+dataprep.out <- dataprep(
+  foo = basque,
+  predictors = c("school.illit", "school.prim", "school.med",
+                 "school.high", "school.post.high", "invest"),
+  predictors.op = "mean",
+  time.predictors.prior = 1964:1969,
+  special.predictors = list(
+    list("gdpcap", 1960:1969, "mean"),
+    list("sec.agriculture", seq(1961, 1969, 2), "mean"),
+    list("sec.energy", seq(1961, 1969, 2), "mean"),
+    list("sec.industry", seq(1961, 1969, 2), "mean"),
+    list("sec.construction", seq(1961, 1969, 2), "mean"),
+    list("sec.services.venta", seq(1961, 1969, 2), "mean"),
+    list("sec.services.nonventa", seq(1961, 1969, 2), "mean"),
+    list("popdens", 1969, "mean")
+  ),
+  dependent = "gdpcap",
+  unit.variable = "regionno",
+  unit.names.variable = "regionname",
+  time.variable = "year",
+  treatment.identifier = 17,  # Basque Country
+  controls.identifier = c(2:16, 18),  # All other regions except Spain aggregate
+  time.optimize.ssr = 1960:1969,
+  time.plot = 1955:1997
+)
+
+# Run synthetic control
+synth.out <- synth(data.prep.obj = dataprep.out, method = "BFGS")
+
+# Get the results
+synth.tables <- synth.tab(dataprep.res = dataprep.out, synth.res = synth.out)
+```
+
+## Synthetic Control Weights
+
+Which regions form the "synthetic" Basque Country?
+
+```{r synth-weights}
+# Extract and display weights
+weights_df <- data.frame(
+  Region = rownames(synth.out$solution.w),
+  Weight = round(as.numeric(synth.out$solution.w), 4)
+) %>%
+  dplyr::filter(Weight > 0.001) %>%
+  dplyr::arrange(dplyr::desc(Weight))
+
+weights_df
+
+```
+
+The synthetic Basque Country is primarily composed of Cataluna and Madrid. These weights are chosen to best match pre-treatment characteristics.
+
+## Balance Table
+
+How well does the synthetic control match the Basque Country before treatment?
+
+```{r balance-table}
+# Create balance table
+balance_table <- data.frame(
+  Variable = rownames(synth.tables$tab.pred),
+  Basque = round(synth.tables$tab.pred[, 1], 2),
+  Synthetic = round(synth.tables$tab.pred[, 2], 2),
+  Sample = round(synth.tables$tab.pred[, 3], 2)
+) %>%
+  mutate(Difference = Basque - Synthetic)
+
+# donor pool identifiers
+controls <- dataprep.out$controls.identifier
+
+# compute SDs for predictors in donor pool
+pred_sds <- sapply(rownames(synth.tables$tab.pred), function(v) {
+  sd(dataprep.out$X0[v, ], na.rm = TRUE)
+})
+
+balance_table <- data.frame(
+  Variable = rownames(synth.tables$tab.pred),
+  Basque = round(synth.tables$tab.pred[, 1], 2),
+  Synthetic = round(synth.tables$tab.pred[, 2], 2),
+  Sample = round(synth.tables$tab.pred[, 3], 2)
+) %>%
+  mutate(
+    Difference = Basque - Synthetic,
+    SMD = Difference / pred_sds #Standardized Mean Difference
+  )
+
+balance_table
+```
+
+The synthetic control matches the Basque Country on pre-treatment covariates except education variables.
+
+
+## The Main Result: Treatment Effect
+
+```{r synth-plot, fig.width=10, fig.height=7}
+# Create the synthetic control plot
+path.plot(
+  synth.res = synth.out,
+  dataprep.res = dataprep.out,
+  Ylab = "Real GDP per Capita (thousand pesetas)",
+  Xlab = "Year",
+  Legend = c("Basque Country", "Synthetic Basque Country"),
+  Legend.position = "topleft",
+  Main = "GDP per Capita: Basque Country vs Synthetic Control"
+)
+
+# Add treatment line
+abline(v = 1970, lty = 2, col = "red", lwd = 2)
+text(1970, max(dataprep.out$Y1plot), "Treatment begins", pos = 4, col = "red")
+```
+
+```{r gaps-plot, fig.width=10, fig.height=7}
+# Plot the gap (treatment effect over time)
+gaps.plot(
+  synth.res = synth.out,
+  dataprep.res = dataprep.out,
+  Ylab = "Gap in GDP per Capita",
+  Xlab = "Year",
+  Main = "Treatment Effect: Gap Between Basque Country and Synthetic Control"
+)
+
+abline(h = 0, lty = 2, col = "gray50")
+abline(v = 1970, lty = 2, col = "red", lwd = 2)
+```
+
+
+## Quantifying the Effect
+
+```{r calculate-effects}
+# Calculate average treatment effect post-1970
+Y1 <- dataprep.out$Y1plot
+Y0 <- dataprep.out$Y0plot %*% synth.out$solution.w
+
+# Create a data frame of gaps
+gaps_df <- data.frame(
+  year = as.numeric(rownames(Y1)),
+  treated = as.numeric(Y1),
+  synthetic = as.numeric(Y0),
+  gap = as.numeric(Y1 - Y0)
+)
+
+# Calculate ATT for different periods
+att_estimates <- gaps_df %>%
+  filter(year >= 1970) %>%
+  summarise(
+    `1970-1979` = mean(gap[year >= 1970 & year <= 1979]),
+    `1980-1989` = mean(gap[year >= 1980 & year <= 1989]),
+    `1990-1997` = mean(gap[year >= 1990 & year <= 1997]),
+    `Overall (1970-1997)` = mean(gap)
+  ) %>%
+  pivot_longer(everything(), names_to = "Period", values_to = "ATT")
+
+att_estimates %>%
+  kable(
+    col.names = c("Period", "Average Treatment Effect (GDP per capita)"),
+    caption = "Estimated Economic Cost of Terrorism",
+    digits = 4
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+On average, the Basque Country's GDP per capita was approximately **`r round(att_estimates$ATT[4], 0)` thousand pesetas lower** than it would have been without terrorism (1970-1997 average).
+
+
+## Placebo Tests: In-Space Permutation
+
+To assess whether this effect is unusual, we run placebo tests by applying the same procedure to control regions.
+
+```{r placebo-space1, results='hide'}
+# Store all control unit numbers
+control_units <- c(2:16, 18)
+
+# Initialize storage for placebo gaps
+placebo_gaps <- matrix(NA, nrow = length(1955:1997), ncol = length(control_units))
+rownames(placebo_gaps) <- 1955:1997
+
+# Run synthetic control for each control unit
+for(i in 1:length(control_units)) {
+  
+  # Prepare data with this control unit as "treated"
+  tryCatch({
+    dataprep_placebo <- dataprep(
+      foo = basque,
+      predictors = c("school.illit", "school.prim", "school.med",
+                     "school.high", "school.post.high", "invest"),
+      predictors.op = "mean",
+      time.predictors.prior = 1964:1969,
+      special.predictors = list(
+        list("gdpcap", 1960:1969, "mean"),
+        list("sec.agriculture", seq(1961, 1969, 2), "mean"),
+        list("sec.energy", seq(1961, 1969, 2), "mean"),
+        list("sec.industry", seq(1961, 1969, 2), "mean"),
+        list("sec.construction", seq(1961, 1969, 2), "mean"),
+        list("sec.services.venta", seq(1961, 1969, 2), "mean"),
+        list("sec.services.nonventa", seq(1961, 1969, 2), "mean"),
+        list("popdens", 1969, "mean")
+      ),
+      dependent = "gdpcap",
+      unit.variable = "regionno",
+      unit.names.variable = "regionname",
+      time.variable = "year",
+      treatment.identifier = control_units[i],
+      controls.identifier = c(control_units[-i], 17),
+      time.optimize.ssr = 1960:1969,
+      time.plot = 1955:1997
+    )
+    
+    synth_placebo <- synth(data.prep.obj = dataprep_placebo, method = "BFGS")
+    
+    # Store gaps
+    Y1_placebo <- dataprep_placebo$Y1plot
+    Y0_placebo <- dataprep_placebo$Y0plot %*% synth_placebo$solution.w
+    placebo_gaps[, i] <- Y1_placebo - Y0_placebo
+    
+  }, error = function(e) {
+    # Skip if synthetic control fails for this unit
+    NULL
+  })
+}
+```
+
+```{r placebo-space2, fig.width=10, fig.height=8}
+# Plot all placebo gaps
+placebo_df <- as.data.frame(placebo_gaps) %>%
+  mutate(year = as.numeric(rownames(.))) %>%
+  pivot_longer(-year, names_to = "unit", values_to = "gap")
+
+# Create plot
+ggplot() +
+  geom_line(data = placebo_df, 
+            aes(x = year, y = gap, group = unit), 
+            alpha = 0.3, color = "gray50") +
+  geom_line(data = gaps_df, 
+            aes(x = year, y = gap), 
+            color = "#D55E00", linewidth = 1.5) +
+  geom_vline(xintercept = 1970, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = 0, linetype = "solid", color = "black", alpha = 0.3) +
+  labs(
+    title = "In-Space Placebo Test",
+    subtitle = "Basque Country (orange) vs placebo gaps for all control regions (gray)",
+    x = "Year",
+    y = "Gap in GDP per Capita",
+    caption = "Each gray line represents a 'placebo treatment' applied to a control region"
+  ) +
+  annotate("text", x = 1970, y = max(placebo_df$gap, na.rm = TRUE), 
+           label = "Treatment", hjust = -0.1, color = "red")
+```
+
+**Interpretation**: The Basque Country's gap (orange) is much larger and more persistent than most placebo gaps (gray), suggesting the effect is unlikely to be due to chance.
+
+## Placebo Tests: In-Time Permutation
+
+Test whether the effect would appear if we pretend treatment occurred earlier.
+
+```{r placebo-time1, results='hide'}
+# Try treatment in 1965 instead of 1970
+dataprep_time_placebo <- dataprep(
+  foo = basque,
+  predictors = c("school.illit", "school.prim", "school.med",
+                 "school.high", "school.post.high", "invest"),
+  predictors.op = "mean",
+  time.predictors.prior = 1960:1964,  # Pre-treatment period for fake treatment
+  special.predictors = list(
+    list("gdpcap", 1960:1964, "mean"),
+    list("sec.agriculture", 1960:1964, "mean"),
+    list("sec.energy", 1960:1964, "mean"),
+    list("sec.industry", 1960:1964, "mean"),
+    list("sec.construction", 1960:1964, "mean"),
+    list("sec.services.venta", 1960:1964, "mean"),
+    list("sec.services.nonventa", 1960:1964, "mean"),
+    list("popdens",1960:1969, "mean")
+  ),
+  dependent = "gdpcap",
+  unit.variable = "regionno",
+  unit.names.variable = "regionname",
+  time.variable = "year",
+  treatment.identifier = 17,
+  controls.identifier = c(2:16, 18),
+  time.optimize.ssr = 1960:1964,
+  time.plot = 1955:1969  # Only look at pre-actual-treatment period
+)
+
+synth_time_placebo <- synth(data.prep.obj = dataprep_time_placebo, method = "BFGS")
+```
+
+
+```{r placebo-time2, fig.width=10, fig.height=7}
+# Plot
+path.plot(
+  synth.res = synth_time_placebo,
+  dataprep.res = dataprep_time_placebo,
+  Ylab = "Real GDP per Capita",
+  Xlab = "Year",
+  Legend = c("Basque Country", "Synthetic (placebo)"),
+  Main = "In-Time Placebo Test: Pretend Treatment in 1965"
+)
+abline(v = 1965, lty = 2, col = "red", lwd = 2)
+```
+
+**Interpretation**: No systematic gap appears before the actual treatment, supporting the validity of the synthetic control approach.
+
+
+
+
+# Part 2: Generalized Synthetic Control (GSynth)
+
+The **Generalized Synthetic Control** method (Xu 2017) extends the traditional synthetic control approach by using **interactive fixed effects models** (IFE).
+
+## Key Conceptual Difference from Traditional SC
+
+**Traditional SC**: Creates synthetic control as weighted average of control units
+- Weights sum to 1, all positive
+- Matches on pre-treatment covariates
+
+**GSynth**: Models outcome as combination of:
+- Additive fixed effects (unit + time)
+- **Interactive fixed effects**: factors (time-varying) × loadings (unit-specific)
+
+
+## Preparing Data for GSynth
+
+The `fect` package requires data in long format with unit and time identifiers:
+
+```{r gsynth-prep}
+# Prepare data for fect/gsynth
+
+basque_gsynth <- basque %>%
+  filter(regionno != 1) %>%  # drop Spain aggregate
+  mutate(
+    region_id = regionno,
+    treated   = as.integer(regionno == 17 & year >= 1970)  # 0 before 1970, 1 from 1970 on
+  ) %>%
+  select(
+    region_id, regionname, year, gdpcap, treated, 
+    invest, school.illit, school.prim, school.med, school.high, 
+    school.post.high,sec.agriculture, sec.energy, sec.construction, 
+    sec.industry, sec.services.venta, sec.services.nonventa,popdens
+  ) %>%
+  arrange(region_id, year)
+
+# Check data structure
+glimpse(basque_gsynth)
+
+panelview(gdpcap ~ treated, data = basque_gsynth,  index = c("region_id","year"), pre.post = TRUE) 
+
+```
+
+
+## Estimation with Cross-Validation
+
+GSynth automatically selects the number of factors using cross-validation:
+
+```{r gsynth-estimate, cache=TRUE}
+
+gsynth_out <- fect(
+  gdpcap ~ treated + invest,
+  data = basque_gsynth,
+  index = c("region_id", "year"),
+  method = "gsynth",  #generalized synthetic control
+  force = "two-way",  # Include unit and time fixed effects
+  CV = TRUE,          # Cross-validate number of factors
+  r = c(0, 5),        # Search 0-5 factors
+  se = TRUE,          # Compute standard errors
+  vartype = "parametric",  # Parametric bootstrap (good for small Ntr)
+  nboots = 500,       # Number of bootstrap replications
+  parallel = TRUE,    # Use parallel computing
+  seed = 12345
+)
+
+
+
+# Print summary
+gsynth_out$est.att
+gsynth_out$est.avg #ATT averaged over all periods
+gsynth_out$est.beta #coefficients of the time-varying covariates
+
+
+#Weights
+dim(gsynth_out$wgt.implied)
+sort(gsynth_out$wgt.implied)
+
+```
+
+
+## Visualizing Results
+
+### Treatment Effect Over Time
+
+```{r gsynth-gap, fig.width=10, fig.height=6}
+# Gap plot: Treatment effect by period
+plot(gsynth_out, 
+     type = "gap",
+     main = "GSynth: Estimated Treatment Effect on GDP",
+     xlab = "Years Relative to Treatment",
+     ylab = "Effect on GDP per Capita",
+     xlim = c(-10, 27))
+```
+
+### Counterfactual Trajectories
+
+```{r gsynth-counterfactual, fig.width=10, fig.height=6}
+# Show observed vs counterfactual
+plot(gsynth_out,
+     type = "counterfactual",
+     main = "Observed vs Counterfactual GDP (GSynth)",
+     xlab = "Year",
+     ylab = "GDP per Capita")
+```
+
+### Individual Treatment Effects
+
+```{r gsynth-box, fig.width=10, fig.height=5}
+# Box plot of individual effects
+plot(gsynth_out,
+     type = "box",
+     main = "Distribution of Treatment Effects Over Time",
+     xlab = "Years Relative to Treatment")
+```
+
+### Estimated Factors and Loadings
+
+The interactive fixed effects are the key innovation of GSynth. Let's visualize them:
+
+```{r gsynth-factors, fig.width=10, fig.height=5}
+# Plot estimated factors (time-varying components)
+plot(gsynth_out,
+     type = "factors",
+     main = "Estimated Time-Varying Factors",
+     xlab = "Year")
+```
+
+```{r gsynth-loadings, fig.width=10, fig.height=7}
+# Plot factor loadings (unit-specific components)
+plot(gsynth_out,
+     type = "loadings",
+     main = "Estimated Factor Loadings by Region")
+```
+
+
+### Calendar Time Effects
+
+```{r gsynth-calendar, fig.width=10, fig.height=5}
+# How effects evolve over calendar time
+plot(gsynth_out,
+     type = "calendar",
+     main = "Treatment Effect by Calendar Year",
+     ylim = c(-2, 0))
+```
+
+
+## Placebo Test with GSynth
+
+```{r gsynth-placebo, fig.width=10, fig.height=6}
+# Placebo test: pretend treatment happened in 1965
+basque_placebo_gsynth <- basque_gsynth %>%
+  mutate(
+    treated_placebo = ifelse(region_id == 17 & year >= 1965, 1, 0)
+  )
+
+gsynth_placebo <- fect(
+  gdpcap ~ treated_placebo,
+  data = basque_placebo_gsynth %>% filter(year <= 1969),  # Only pre-actual-treatment
+  index = c("region_id", "year"),
+  method = "gsynth",
+  force = "two-way",
+  CV = TRUE,
+  r = c(0, 5),
+  se = TRUE,
+  vartype = "parametric",
+  nboots = 200,
+  parallel = TRUE,
+  seed = 12345
+)
+
+plot(gsynth_placebo,
+     type = "gap",
+     main = "Placebo Test: Fake Treatment in 1965",
+     xlab = "Years Relative to Fake Treatment")
+
+```
+
+**Interpretation**: No systematic effect before actual treatment, supporting validity.
+
+
+
+# Part 3: Augmented Synthetic Control
+
+The **Augmented Synthetic Control** method (Ben-Michael, Feller, and Rothstein 2021) adds a **bias correction term** using an outcome model, making it more robust to misspecification.
+
+## Why Augmented Synth?
+
+Traditional SC can be biased if:
+1. No weighted combination of controls perfectly matches the treated unit
+2. Important confounders are omitted
+
+**Solution**: Use an outcome regression model to correct for bias, while still leveraging SC's data-driven approach.
+
+```{r augsynth}
+# Prepare data for augsynth
+basque_aug <- basque %>%
+  filter(regionno != 1) %>%  # Remove Spain aggregate
+  mutate(
+    treated = ifelse(regionno == 17, 1, 0),
+    time = year
+  )
+
+# Run augmented synthetic control
+# Using ridge regression as the outcome model
+aug_syn <- augsynth(
+  gdpcap ~ treated,
+  unit = regionno,
+  time = year,
+  t_int = 1970,
+  data = basque_aug,
+  progfunc = "Ridge",  # Outcome model
+  scm = TRUE           # Include SC component
+)
+
+# Summary
+summary(aug_syn)
+```
+
+```{r augsynth-plot, fig.width=10, fig.height=7}
+# Plot the results
+plot(aug_syn)
+```
+
+
+
+## Understanding the Bias Correction
+
+```{r bias-correction, fig.width=10, fig.height=6}
+# The augsynth package provides the bias correction term
+# Plot decomposition
+
+att_vec <- summary(aug_syn)$att[,2]
+aug_syn_att <- mean(att_vec, na.rm = TRUE)
+
+aug_df <- basque_aug %>%
+  filter(regionno == 17) %>%
+  select(year, gdpcap) %>%
+  arrange(year)
+
+# Create visualization showing SC + bias correction
+ggplot() +
+  geom_line(data = gaps_df, aes(x = year, y = gap), 
+            color = "#0072B2", linewidth = 1.2,
+            linetype = "dashed") +
+  annotate("text", x = 1985, y = -2, 
+           label = "Traditional SC gap", color = "#0072B2", size = 4) +
+  geom_vline(xintercept = 1970, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = 0, alpha = 0.3) +
+  geom_hline(yintercept = aug_syn_att, color = "#D55E00", linewidth = 1.2) +
+  annotate("text", x = 1985, y = aug_syn_att + 1, 
+           label = "Augmented SC average\n(with bias correction)", 
+           color = "#D55E00", size = 4) +
+  labs(
+    title = "How Augmented Synthetic Control Corrects Bias",
+    subtitle = "Augmented SC adds an outcome model to correct for imperfect pre-treatment fit",
+    x = "Year",
+    y = "Treatment Effect Estimate",
+    caption = "The difference reflects the bias correction from the ridge regression outcome model"
+  ) +
+  theme_minimal()
+```
+
+
+
+
+
+## References
+
+Abadie, Alberto, and Javier Gardeazabal. "The economic costs of conflict: A case study of the Basque Country." *American Economic Review* 93.1 (2003): 113-132.
+
+Abadie, Alberto, Alexis Diamond, and Jens Hainmueller. "Synthetic control methods for comparative case studies: Estimating the effect of California's tobacco control program." *Journal of the American Statistical Association* 105.490 (2010): 493-505.
+
+Arkhangelsky, Dmitry, Susan Athey, David A. Hirshberg, Guido W. Imbens, and Stefan Wager. "Synthetic difference-in-differences." *American Economic Review* 111.12 (2021): 4088-4118.
+
+Ben-Michael, Eli, Avi Feller, and Jesse Rothstein. "The augmented synthetic control method." *Journal of the American Statistical Association* 116.536 (2021): 1789-1803.
+
+Xu, Yiqing. "Generalized synthetic control method: Causal inference with interactive fixed effects models." *Political Analysis* 25.1 (2017): 57-76.
+
+Athey, Susan, Guido Imbens, Zhaonan Qu, and Davide Viviano. "Triply robust panel estimators." arXiv preprint arXiv:2508.21536 (2025).
+
+---
+
+**Session Information**
+
+```{r session-info}
+sessionInfo()
+```
