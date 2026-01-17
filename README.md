@@ -2,6 +2,13 @@
 
 This repository hosts the course section materials, including lecture notes, code, and examples.
 
+## How to Use These Materials
+
+- Download or clone the repository
+- Open `.qmd` files in RStudio
+- Run code chunks interactively during or after section
+- Render files if you want the full HTML output
+
 ## 🎥 Section Recordings
 You can find recordings of the discussion sections here:  
 https://drive.google.com/drive/folders/1iSlbD3-OkJTk3BqS5j41hffn2FAX4dQs?usp=sharing
