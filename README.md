@@ -6,7 +6,7 @@ This repository hosts the course section materials, including lecture notes, cod
 
 - Download or clone the repository
 - Open `.qmd` files in RStudio
-- Run code chunks interactively during or after section
+- Run code chunks yourself, change things, explore more
 - Render files if you want the full HTML output
 
 ## 🎥 Section Recordings
