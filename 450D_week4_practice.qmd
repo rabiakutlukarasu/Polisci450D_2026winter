@@ -1,7 +1,7 @@
 ---
 title: "Week 4: Treatment Effect Heterogeneity"
 subtitle: "From Linear Interactions to Machine Learning"
-author: "TA Section Materials"
+author: "Rabia Kutlu Karasu"
 date: "January 26, 2026"
 format:
   html:
@@ -105,7 +105,21 @@ cat("Treatment distribution:\n")
 table(huddy$threat)
 ```
 
-# Exploratory Visualization
+# Exploratory Visualizations
+
+## Common Support
+
+```{r support-check, fig.width=10, fig.height=6}
+out_raw <- interflex(
+  estimator = "raw",
+  Y = Y, D = D, X = X,
+  data = huddy,
+  Xlabel = Xlabel, Ylabel = Ylabel, Dlabel = Dlabel,
+  theme.bw = TRUE, nbins = 10
+)
+
+out_raw
+```
 
 ```{r raw-plots, fig.width=10, fig.height=5}
 # Create plotting data
@@ -139,6 +153,7 @@ grid.arrange(p1, p2, ncol = 2)
 ```
 
 **Key Observation**: Gap widens as partisan ID increases → heterogeneous effects!
+
 
 # Part 1: Traditional Methods
 
@@ -342,29 +357,12 @@ kable(effects, digits = 3, caption = "Treatment Effects by Partisan Identity")
 ```
 
 
-# Diagnostic Checks
-
-## Common Support
-
-```{r support-check, fig.width=10, fig.height=6}
-out_raw <- interflex(
-  estimator = "raw",
-  Y = Y, D = D, X = X,
-  data = huddy,
-  Xlabel = Xlabel, Ylabel = Ylabel, Dlabel = Dlabel,
-  theme.bw = TRUE, nbins = 10
-)
-
-out_raw
-```
-
-✓ Excellent overlap across full partisan ID range
 
 # Exercises
 
 ## Exercise 1: Gender Differences
 
-```{r ex1, eval=FALSE}
+```{r ex1}
 huddy_male <- huddy %>% filter(male == 1) %>% as.data.frame()
 huddy_female <- huddy %>% filter(male == 0) %>% as.data.frame()
 
@@ -382,7 +380,7 @@ grid.arrange(out_male$figure + ggtitle("Males"),
 
 ## Exercise 2: Alternative Moderator
 
-```{r ex2, eval=FALSE}
+```{r ex2}
 # Try political knowledge as moderator
 out_knowledge <- interflex(
   estimator = "kernel", 
