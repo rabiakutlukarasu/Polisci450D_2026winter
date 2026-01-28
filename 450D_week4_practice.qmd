@@ -1,0 +1,411 @@
+---
+title: "Week 4: Treatment Effect Heterogeneity"
+subtitle: "From Linear Interactions to Machine Learning"
+author: "TA Section Materials"
+date: "January 26, 2026"
+format:
+  html:
+    code-fold: false
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    highlight-style: github
+    fig-width: 10
+    fig-height: 6
+  pdf:
+    toc: true
+    number-sections: true
+execute:
+  warning: false
+  message: false
+---
+
+# Learning Objectives
+
+The aim is to:
+
+1. Understand when and why treatment effects are heterogeneous
+2. Estimate conditional marginal effects using linear and kernel methods
+3. Apply machine learning methods (DML) for robustness
+4. Compare all methods and understand when each is appropriate
+5. Interpret results substantively
+
+# Setup
+
+```{r setup | message: false}
+# devtools::install_github('xuyiqing/interflex')
+
+library(interflex)    # Main package
+library(tidyverse)    # Data manipulation
+library(gridExtra)    # Multiple plots
+library(knitr)        # Tables
+library(reticulate)
+
+reticulate::use_condaenv("r-reticulate")
+# Install miniconda if you haven't
+reticulate::install_miniconda(force = TRUE)
+
+# Create conda environment
+conda_create("interflex_dml")
+
+# Use it
+use_condaenv("interflex_dml", required = TRUE)
+
+# Install packages
+conda_install("interflex_dml", 
+              c("numpy", "pandas", "scikit-learn", "patsy", "econml", "doubleml"),
+              pip = TRUE)
+# Verify
+py_config()
+
+# Add to qmd setup chunk:
+use_condaenv("interflex_dml", required = TRUE)
+
+theme_set(theme_bw())
+```
+
+# The Huddy et al. (2015) Study
+
+**Research Question**: Do terrorism threats increase anger differently for Democrats vs. Republicans?
+
+**Theory**: Affective Intelligence Theory
+- Threats activate partisan identities
+- Republicans traditionally more supportive of strong national security
+- Effect should increase with Republican identification
+
+**Design**: Survey experiment (~1,600 respondents)
+- **Treatment**: Random assignment to threat vs. control article
+- **Moderator**: Partisan identity (0=Democrat to 1=Republican)
+- **Outcome**: Anger toward threatening group (0-1 scale)
+
+**Hypothesis**: τ(partisan ID) increases with Republican identification
+
+# Load Data
+
+```{r load-data}
+# Load built-in data
+data(interflex)
+huddy <- as.data.frame(app_hma2015)  # Must be data.frame!
+
+# Define variables
+Y <- "totangry"     # Outcome
+D <- "threat"       # Treatment (0/1)
+X <- "pidentity"    # Moderator (0-1)
+Z <- c("issuestr2", "pidstr2", "knowledge", "educ", "male", "age10")
+
+# Labels
+Ylabel <- "Anger"
+Dlabel <- "Threat"
+Xlabel <- "Partisan Identity (0=Dem, 1=Rep)"
+
+# Quick check
+cat("Sample size:", nrow(huddy), "\n")
+cat("Treatment distribution:\n")
+table(huddy$threat)
+```
+
+# Exploratory Visualization
+
+```{r raw-plots, fig.width=10, fig.height=5}
+# Create plotting data
+huddy_plot <- huddy %>%
+  mutate(
+    threat_label = factor(threat, levels = c(0,1), labels = c("Control", "Threat")),
+    partisan_cat = cut(pidentity, breaks = c(0, 0.33, 0.67, 1),
+                      labels = c("Dem", "Ind", "Rep"), include.lowest = TRUE)
+  )
+
+# Box plots
+p1 <- ggplot(huddy_plot, aes(x = partisan_cat, y = totangry, fill = threat_label)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(x = "Partisan ID", y = "Anger", fill = "", title = "Raw Data") +
+  theme(legend.position = "top")
+
+# Means by partisan ID
+means_data <- huddy_plot %>%
+  group_by(pidentity, threat_label) %>%
+  summarise(mean_anger = mean(totangry), se = sd(totangry)/sqrt(n()), .groups = "drop")
+
+p2 <- ggplot(means_data, aes(x = pidentity, y = mean_anger, color = threat_label)) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  geom_ribbon(aes(ymin = mean_anger - 1.96*se, ymax = mean_anger + 1.96*se, 
+                  fill = threat_label), alpha = 0.2, color = NA) +
+  labs(x = Xlabel, y = "Mean Anger", color = "", fill = "", 
+       title = "Lines Diverge → Heterogeneity") +
+  theme(legend.position = "top")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+**Key Observation**: Gap widens as partisan ID increases → heterogeneous effects!
+
+# Part 1: Traditional Methods
+
+## Linear Estimator
+
+**Model**: τ(x) = β₁ + β₃·x (linear in partisan identity)
+
+```{r linear-estimator, fig.width=10, fig.height=6}
+out_linear <- interflex(
+  estimator = "linear",
+  Y = Y, D = D, X = X, Z = Z,
+  data = huddy,
+  vartype = "delta",
+  Xlabel = Xlabel, Ylabel = Ylabel, Dlabel = Dlabel,
+  theme.bw = TRUE, Xdistr = "histogram",
+  ylab = "Effect of Threat on Anger", ylim = c(-0.2, 0.7)
+)
+
+out_linear$figure
+```
+
+### Extract Coefficients
+
+```{r linear-coefs}
+model <- lm(totangry ~ threat * pidentity + issuestr2 + pidstr2 + 
+            knowledge + educ + male + age10, data = huddy)
+
+coef_table <- summary(model)$coefficients
+print(coef_table["threat:pidentity", ])
+
+beta_int <- coef(model)["threat:pidentity"]
+cat("\n=== Interpretation ===")
+cat("\nInteraction coefficient (β₃):", round(beta_int, 4))
+cat("\nEach 0.1 increase in partisan ID increases threat effect by", 
+    round(beta_int * 0.1, 3), "points")
+```
+
+## Kernel Estimator
+
+**Nonparametric**: No functional form assumption
+
+```{r kernel-estimator, fig.width=10, fig.height=6}
+out_kernel <- interflex(
+  estimator = "kernel",
+  Y = Y, D = D, X = X, Z = Z,
+  data = huddy,
+  vartype = "bootstrap", nboots = 200,
+  metric = "MSE",
+  Xlabel = Xlabel, Ylabel = Ylabel, Dlabel = Dlabel,
+  theme.bw = TRUE, Xdistr = "histogram",
+  ylab = "Effect of Threat on Anger", ylim = c(-0.2, 0.7)
+)
+
+out_kernel$figure
+cat("\nOptimal bandwidth:", round(out_kernel$bw, 3))
+```
+
+## Compare Linear vs. Kernel
+
+```{r compare-traditional, fig.width=12, fig.height=5}
+grid.arrange(
+  out_linear$figure + ggtitle("Linear") + ylab(NULL),
+  out_kernel$figure + ggtitle("Kernel") + ylab(NULL),
+  ncol = 2
+)
+```
+
+**Finding**: Both show same linear pattern → linear model appropriate!
+
+# Part 2: Machine Learning Methods (DML)
+
+## What is DML?
+
+**Double/Debiased Machine Learning** (Chernozhukov et al. 2018):
+
+**Problem**: High-dimensional confounders, complex relationships
+
+**Solution**: 
+1. Use ML to estimate nuisance functions (outcome model, propensity score)
+2. Apply debiasing correction (Neyman orthogonality)
+3. Get valid inference even with flexible ML methods
+
+**Three Key Ingredients**:
+1. **Neyman orthogonality**: Bias in nuisance estimates doesn't affect main parameter
+2. **High-quality ML**: Accurate function estimation
+3. **Cross-fitting**: Reduces overfitting bias
+
+**For Huddy et al.**:
+- Binary treatment → Interactive Regression Model (IRM)
+- Estimates: E[Y(1) - Y(0) | X = x]
+
+## DML Method 1: Neural Network
+
+```{r dml-nn}
+
+out_dml_nn <- interflex(
+  estimator = 'DML',
+  Y = Y, D = D, X = X, Z = Z,
+  data = huddy,
+  treat.type = "discrete",  # Binary treatment
+  model.y = "nn",  # Neural network for outcome
+  model.t = "nn",  # Neural network for propensity score
+  Xlabel = Xlabel, Ylabel = Ylabel, Dlabel = Dlabel,
+  theme.bw = TRUE, ylim = c(-0.2, 0.7)
+)
+
+out_dml_nn$figure
+```
+
+## DML Method 2: Random Forest
+
+```{r dml-rf}
+out_dml_rf <- interflex(
+  estimator = 'DML',
+  Y = Y, D = D, X = X, Z = Z,
+  data = huddy,
+  treat.type = "discrete",
+  model.y = "rf",  # Random forest
+  model.t = "rf",
+  Xlabel = Xlabel, Ylabel = Ylabel, Dlabel = Dlabel,
+  theme.bw = TRUE, ylim = c(-0.2, 0.7)
+)
+
+out_dml_rf$figure
+```
+
+## DML Method 3: Gradient Boosting
+
+```{r dml-hgb}
+out_dml_hgb <- interflex(
+  estimator = 'DML',
+  Y = Y, D = D, X = X, Z = Z,
+  data = huddy,
+  treat.type = "discrete",
+  model.y = "hgb",  # Histogram gradient boosting
+  model.t = "hgb",
+  Xlabel = Xlabel, Ylabel = Ylabel, Dlabel = Dlabel,
+  theme.bw = TRUE, ylim = c(-0.2, 0.7)
+)
+
+out_dml_hgb$figure
+```
+
+## Compare All Five Methods
+
+```{r compare-all, fig.width=12, fig.height=8}
+# Create grid of all methods
+grid.arrange(
+  out_linear$figure + ggtitle("1. Linear") + ylab(NULL),
+  out_kernel$figure + ggtitle("2. Kernel") + ylab(NULL),
+  out_dml_nn$figure + ggtitle("3. DML: Neural Net") + ylab(NULL),
+  out_dml_rf$figure + ggtitle("4. DML: Random Forest") + ylab(NULL),
+  out_dml_hgb$figure + ggtitle("5. DML: Gradient Boost") + ylab(NULL),
+  layout_matrix = rbind(c(1, 2), c(3, 4), c(5, NA)),
+  heights = c(1, 1, 1)
+)
+```
+
+All five methods show a similar linear increasing pattern!
+
+**Why?**: 
+- Not high-dimensional
+- True relationship is linear
+- Clean experimental data
+
+
+**Recommendation**:
+1. **Primary**: Linear (simple, interpretable, sufficient)
+2. **Robustness**: Kernel (check linearity)
+3. **Extra robustness**: DML
+
+**Result**: All methods agree → robust findings!
+
+# Main Findings
+
+## Effects at Key Values
+
+```{r effects-table}
+# Extract effects from linear model
+cme_df <- as.data.frame(out_linear$est.lin)
+colnames(cme_df) <- c("partisan_id", "effect", "se", "ci_lower", "ci_upper")
+
+key_vals <- c(0, 0.33, 0.5, 0.67, 1.0)
+key_labs <- c("Strong Dem", "Lean Dem", "Independent", "Lean Rep", "Strong Rep")
+
+effects <- map_dfr(key_vals, function(x) {
+  idx <- which.min(abs(cme_df$partisan_id - x))
+  ci_low <- cme_df$ci_lower[idx]
+  ci_high <- cme_df$ci_upper[idx]
+  
+  tibble(
+    Label = key_labs[which(key_vals == x)],
+    Effect = cme_df$effect[idx],
+    CI_lower = ci_low,
+    CI_upper = ci_high,
+    Sig = ifelse(ci_low > 0 | ci_high < 0, "Yes", "No")
+  )
+})
+
+kable(effects, digits = 3, caption = "Treatment Effects by Partisan Identity")
+```
+
+
+# Diagnostic Checks
+
+## Common Support
+
+```{r support-check, fig.width=10, fig.height=6}
+out_raw <- interflex(
+  estimator = "raw",
+  Y = Y, D = D, X = X,
+  data = huddy,
+  Xlabel = Xlabel, Ylabel = Ylabel, Dlabel = Dlabel,
+  theme.bw = TRUE, nbins = 10
+)
+
+out_raw
+```
+
+✓ Excellent overlap across full partisan ID range
+
+# Exercises
+
+## Exercise 1: Gender Differences
+
+```{r ex1, eval=FALSE}
+huddy_male <- huddy %>% filter(male == 1) %>% as.data.frame()
+huddy_female <- huddy %>% filter(male == 0) %>% as.data.frame()
+
+out_male <- interflex(estimator = "linear", Y = Y, D = D, X = X, Z = Z,
+                      data = huddy_male, vartype = "delta", theme.bw = TRUE,
+                      ylim = c(-0.2, 0.7))
+
+out_female <- interflex(estimator = "linear", Y = Y, D = D, X = X, Z = Z,
+                        data = huddy_female, vartype = "delta", theme.bw = TRUE,
+                        ylim = c(-0.2, 0.7))
+
+grid.arrange(out_male$figure + ggtitle("Males"),
+             out_female$figure + ggtitle("Females"), ncol = 2)
+```
+
+## Exercise 2: Alternative Moderator
+
+```{r ex2, eval=FALSE}
+# Try political knowledge as moderator
+out_knowledge <- interflex(
+  estimator = "kernel", 
+  Y = Y, D = D, X = "knowledge",
+  Z = c("pidentity", "issuestr2", "pidstr2", "educ", "male", "age10"),
+  data = huddy, 
+  vartype = "bootstrap", 
+  metric = "MSE", 
+  theme.bw = TRUE
+)
+
+out_knowledge$figure
+```
+
+
+
+
+# Resources
+
+- **Paper**: Huddy et al. (2015) *APSR* 109(1): 1-17
+- **Package**: https://yiqingxu.org/packages/interflex/
+- **DML Guide**: https://yiqingxu.org/packages/interflex/articles/dml.html
+
+---
+
+**Questions? Let's discuss!**
