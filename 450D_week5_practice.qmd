@@ -1,0 +1,549 @@
+---
+title: "Causal Mediation Analysis"
+subtitle: "Week 5 Practice Section"
+author: "Rabia Kutlu Karasu"
+date: today
+format:
+  html:
+    code-fold: false
+    self-contained: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    highlight-style: github
+  pdf:
+    toc: true
+    number-sections: true
+execute:
+  warning: false
+  message: false
+---
+
+## Overview
+
+Today, we'll practice causal mediation analysis using the framework developed by Imai, Keele, Tingley, and Yamamoto. 
+We'll cover:
+
+1. Understanding the causal mediation framework
+2. Estimating Average Causal Mediation Effects (ACME)
+3. Conducting sensitivity analysis
+4. Comparing traditional and modern approaches
+
+## Setup
+
+```{r setup}
+# Load required packages
+library(tidyverse)
+library(mediation)  # Imai et al.'s package
+library(gt)       
+library(patchwork)
+library(dplyr)
+library(broom)
+
+theme_set(theme_bw()) # Setting theme for plots
+```
+
+## The JOBS II Data
+
+We'll use the JOBS II Field Experiment data (Vinokur et al. 1995), which is built into the `mediation` package. This was a randomized experiment with 1,801 unemployed workers.
+
+**Research Question**: Does a job-skills training workshop reduce depression, and if so, does it work through increasing job-seeking self-efficacy?
+
+- **Treatment** (`treat`): Job-skills workshop (1) vs. control booklet (0)
+- **Mediator** (`job_seek`): Job-seeking self-efficacy (measured after treatment)
+- **Outcome** (`depress2`): Depression level (measured after mediator)
+- **Covariates**: Pre-treatment depression, age, sex, education, income, etc.
+
+```{r load-data}
+# Load the JOBS II data
+data(jobs)
+
+glimpse(jobs)
+
+# Summary statistics
+jobs %>%
+  dplyr::select(treat, job_seek, depress2, depress1, age, sex) %>%
+  base::summary()
+```
+
+### Visualize the relationships
+
+```{r visualize-data, fig-width: 4}
+
+# Treatment effect on mediator
+p1 <- ggplot(jobs, aes(x = factor(treat), y = job_seek)) +
+  geom_boxplot(aes(fill = factor(treat)), alpha = 0.6) +
+  geom_jitter(alpha = 0.1, width = 0.2) +
+  scale_fill_manual(values = c("0" = "#E74C3C", "1" = "#3498DB")) +
+  labs(x = "Treatment", y = "Job-Seeking Self-Efficacy",
+       title = "Treatment → Mediator") +
+  theme(legend.position = "none")
+
+# Mediator effect on outcome
+p2 <- ggplot(jobs, aes(x = job_seek, y = depress2)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", color = "#2ECC71") +
+  labs(x = "Job-Seeking Self-Efficacy", y = "Depression",
+       title = "Mediator → Outcome")
+
+# Treatment effect on outcome
+p3 <- ggplot(jobs, aes(x = factor(treat), y = depress2)) +
+  geom_boxplot(aes(fill = factor(treat)), alpha = 0.6) +
+  geom_jitter(alpha = 0.1, width = 0.2) +
+  scale_fill_manual(values = c("0" = "#E74C3C", "1" = "#3498DB")) +
+  labs(x = "Treatment", y = "Depression",
+       title = "Treatment → Outcome (Total Effect)") +
+  theme(legend.position = "none")
+
+p1 + p2 + p3 # Combine plots
+```
+
+## Conceptual Framework
+
+### Causal Quantities of Interest
+
+Following Imai et al. (2010), we define:
+
+1. **Average Causal Mediation Effect (ACME)**: 
+   - $\delta(t) = E[Y_i(t, M_i(1)) - Y_i(t, M_i(0))]$
+   - The effect of treatment on outcome that operates through the mediator
+
+2. **Average Direct Effect (ADE)**:
+   - $\zeta(t) = E[Y_i(1, M_i(t)) - Y_i(0, M_i(t))]$
+   - The effect of treatment on outcome not through the mediator
+
+3. **Total Effect**:
+   - $\tau = E[Y_i(1, M_i(1)) - Y_i(0, M_i(0))]$
+   - ACME + ADE = Total Effect
+
+4. **Proportion Mediated**:
+   - $\rho = \frac{\delta(t)}{\tau}$
+   - What proportion of the total effect is mediated?
+
+### Key Assumption: Sequential Ignorability
+
+$$\{Y_i(t', m), M_i(t)\} \perp T_i | X_i$$
+$$Y_i(t', m) \perp M_i(t) | T_i, X_i$$
+
+This assumes:
+1. Treatment is randomly assigned (satisfied by experimental design)
+2. No unmeasured confounders of M → Y relationship (strong assumption!)
+
+## Traditional Approach: Baron & Kenny (1986)
+
+The traditional approach estimates three regressions:
+
+```{r baron-kenny}
+# Step 1: Treatment → Outcome (total effect)
+model_total <- lm(depress2 ~ treat + depress1  + sex +age+ occp + marital + nonwhite + educ + income, 
+                  data = jobs)
+
+# Step 2: Treatment → Mediator  
+model_mediator <- lm(job_seek ~ treat + depress1  + sex +age+ occp + marital + nonwhite + educ + income, 
+                     data = jobs)
+
+# Step 3: Treatment + Mediator → Outcome
+model_outcome <- lm(depress2 ~ treat + job_seek + depress1  + sex +age+ occp + marital + nonwhite + educ + income, 
+                    data = jobs)
+
+
+baron_kenny_results <- bind_rows(
+  tidy(model_total) %>% filter(term == "treat") %>% mutate(model = "Total Effect (τ)"),
+  tidy(model_mediator) %>% filter(term == "treat") %>% mutate(model = "Treatment → Mediator (α)"),
+  tidy(model_outcome) %>% filter(term == "treat") %>% mutate(model = "Direct Effect (τ')"),
+  tidy(model_outcome) %>% filter(term == "job_seek") %>% mutate(model = "Mediator → Outcome (β)")
+)
+
+baron_kenny_results %>%
+  dplyr::select(model, estimate, std.error, statistic, p.value) %>%
+  gt() %>%
+  tab_header(title = "Baron & Kenny Approach") %>%
+  fmt_number(columns = c(estimate, std.error, statistic), decimals = 3) %>%
+  fmt_number(columns = p.value, decimals = 4)
+
+# Traditional indirect effect: α × β
+alpha <- coef(model_mediator)["treat"]
+beta <- coef(model_outcome)["job_seek"]
+indirect_traditional <- alpha * beta
+
+cat("\nTraditional Indirect Effect (α × β):", round(indirect_traditional, 4))
+```
+
+### Problems with Baron & Kenny
+
+1. **Only works for linear models** with no interactions
+2. **Standard errors are wrong** (product of coefficients has non-normal distribution)
+3. **Doesn't handle treatment-mediator interactions**
+4. **No clear causal interpretation** without strong assumptions
+
+
+## Modern Approach: Imai et al. (2010)
+
+The `mediation` package implements the modern potential outcomes framework:
+
+```{r imai-mediation}
+# Fit mediator model
+med_model <- lm(job_seek ~ treat + depress1  + sex +age+ occp + marital + nonwhite + educ + income, 
+                data = jobs)
+
+
+
+# Fit outcome model
+out_model <- lm(depress2 ~ treat + job_seek + depress1  + sex +age+ occp + marital + nonwhite + educ + income, 
+                data = jobs)
+
+# Conduct mediation analysis
+set.seed(2024)
+med_results <- mediate(
+  med_model,        # mediator model
+  out_model,        # outcome model
+  treat = "treat",  # treatment variable
+  mediator = "job_seek",  # mediator variable
+  boot = TRUE,      # use bootstrap for CIs
+  sims = 1000       # number of simulations
+)
+
+# Print results
+summary(med_results)
+```
+
+### Interpretation
+
+```{r interpret-results}
+# Extract key quantities
+acme <- med_results$d.avg
+ade <- med_results$z.avg
+total <- med_results$tau.coef
+prop_med <- med_results$n.avg
+
+# Create interpretation table
+interpretation <- tibble(
+  Quantity = c("ACME (Average)", "ADE (Average)", "Total Effect", "Prop. Mediated"),
+  Estimate = c(acme, ade, total, prop_med),
+  `Lower 95% CI` = c(med_results$d.avg.ci[1], med_results$z.avg.ci[1], 
+                      med_results$tau.ci[1], med_results$n.avg.ci[1]),
+  `Upper 95% CI` = c(med_results$d.avg.ci[2], med_results$z.avg.ci[2], 
+                      med_results$tau.ci[2], med_results$n.avg.ci[2])
+)
+
+interpretation %>%
+  gt() %>%
+  tab_header(
+    title = "Causal Mediation Analysis Results",
+    subtitle = "JOBS II Data: Job Training → Job-Seeking → Depression"
+  ) %>%
+  fmt_number(columns = -Quantity, decimals = 3) %>%
+  tab_footnote(
+    footnote = "ACME: Average Causal Mediation Effect",
+    locations = cells_body(columns = Quantity, rows = 1)
+  ) %>%
+  tab_footnote(
+    footnote = "ADE: Average Direct Effect",
+    locations = cells_body(columns = Quantity, rows = 2)
+  )
+```
+
+**Key Findings:**
+
+1. **ACME ≈ `r round(acme, 3)`**: The job training reduces depression by approximately `r abs(round(acme, 3))` points through increasing job-seeking self-efficacy
+
+2. **ADE ≈ `r round(ade, 3)`**: The job training has an additional direct effect on depression of `r abs(round(ade, 3))` points (not through job-seeking)
+
+3. **Proportion Mediated ≈ `r round(prop_med * 100, 1)`%**: About `r round(prop_med * 100, 1)`% of the total treatment effect operates through the mediator
+
+### Visualize Results
+
+```{r plot-mediation}
+plot(med_results)
+```
+
+### Visualizing Heterogeneous Effects
+
+In our case: Job training → job-seeking self-efficacy → depression
+
+**Prediction**: If self-efficacy is the mechanism, the treatment effect on depression should vary based on **baseline depression levels**.
+
+Let's plot the estimated treatment effect τ(depress1) across baseline depression values:
+
+```{r heterogeneous}
+# Create prediction data
+
+hte_model <- lm(depress2 ~ treat * depress1 + 
+                  + depress1 + econ_hard + sex + age,
+                data = jobs)
+
+
+pred_data <- expand.grid(
+  treat = 0:1,
+  depress1 = seq(min(jobs$depress1), max(jobs$depress1), length.out = 100),
+  # Set other covariates to their means/modes
+  age = mean(jobs$age),
+  sex = 0,
+  econ_hard = mean(jobs$econ_hard)
+)
+
+# Get predictions
+pred_data$predicted <- predict(hte_model, newdata = pred_data)
+
+# Calculate treatment effects
+te_data <- pred_data %>%
+  tidyr::pivot_wider(names_from = treat, 
+                     values_from = predicted, 
+                     names_prefix = "treat_") %>%
+  mutate(treatment_effect = treat_0 - treat_1)  # Negative = beneficial
+
+ggplot(te_data, aes(x = depress1, y = treatment_effect)) +
+  geom_line(size = 1.2, color = "#2E86AB") +
+  geom_ribbon(aes(ymin = treatment_effect - 0.05, 
+                  ymax = treatment_effect + 0.05),
+              alpha = 0.2, fill = "#2E86AB") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Treatment Effect by Baseline Depression",
+    subtitle = "How does the training effect vary with baseline depression level?",
+    x = "Baseline Depression (depress1)",
+    y = "Treatment Effect on Post-Treatment Depression",
+    caption = "Negative values = treatment reduces depression"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+```
+
+**Caution**: Effect heterogeneity is consistent with the mechanism but does not prove it—other moderators could produce similar patterns.
+
+
+## Sensitivity Analysis
+
+**Critical Question**: How sensitive are our results to violations of sequential ignorability?
+
+If there's an unmeasured confounder U that affects both M and Y, our estimates could be biased.
+
+```{r sensitivity-analysis}
+# Conduct sensitivity analysis
+set.seed(2024)
+sens_results <- medsens(med_results, rho.by = 0.05, effect.type = "both")
+
+summary(sens_results)
+```
+
+### Interpretation of Sensitivity Analysis
+
+The sensitivity parameter $\rho$ represents the correlation between the residuals of the mediator and outcome models.
+
+- $\rho = 0$: No unmeasured confounding (our assumption)
+- $|\rho| > 0$: Increasing amounts of unmeasured confounding
+
+```{r plot-sensitivity}
+# Plot sensitivity analysis
+plot(sens_results, sens.par = "rho", main = "Sensitivity Analysis", 
+     xlab = "Sensitivity Parameter (ρ)", ylab = "ACME")
+```
+
+**Key Question**: At what value of $\rho$ would ACME = 0?
+
+```{r find-critical-rho}
+# Find critical rho where ACME crosses zero
+sens_data <- sens_data <- data.frame(
+  rho   = sens_results$rho,
+  lower = as.numeric(sens_results$lower.d0),
+  upper = as.numeric(sens_results$upper.d0)
+)
+critical_rho_lower <- sens_data$rho[which.min(abs(sens_data$lower))]
+critical_rho_upper <- sens_data$rho[which.min(abs(sens_data$upper))]
+
+cat("Lower bound crosses zero at ρ ≈", round(critical_rho_lower, 3), "\n")
+cat("Upper bound crosses zero at ρ ≈", round(critical_rho_upper, 3), "\n")
+```
+
+### Alternative Parameterization: R²
+
+We can also express sensitivity in terms of the proportion of variance explained:
+
+```{r sensitivity-r2}
+#| fig-width: 10
+#| fig-height: 5
+
+# Plot using R² parameterization
+plot(sens_results, sens.par = "R2", r.type = "total", 
+     main = "Sensitivity Analysis (R² Parameterization)")
+```
+
+The plot shows: "At what product of R² values (variance explained in M and Y by unmeasured confounder) would our conclusion change?"
+
+
+## Extensions: Allowing Treatment-Mediator Interaction
+
+What if the effect of the mediator on the outcome depends on treatment status?
+
+```{r interaction-model}
+# Outcome model with interaction
+out_model_int <- lm(depress2 ~ treat * job_seek + depress1  + sex +age+ occp + marital + nonwhite + educ + income, 
+                    data = jobs)
+
+# Test for interaction
+anova(out_model, out_model_int)
+
+# Mediation analysis with interaction
+set.seed(2024)
+med_results_int <- mediate(
+  med_model, 
+  out_model_int,
+  treat = "treat",
+  mediator = "job_seek",
+  boot = TRUE,
+  sims = 1000
+)
+
+summary(med_results_int)
+```
+
+With interactions, we get **treatment-specific mediation effects**:
+
+- ACME(0): Mediation effect when T=0 (control)
+- ACME(1): Mediation effect when T=1 (treatment)
+
+## Design-Based Alternative: Parallel Design
+
+Imai et al. (2013) propose experimental designs that don't require sequential ignorability.
+
+**Parallel Design**: Randomize both treatment AND mediator:
+- Some units: randomize T, measure M and Y
+- Other units: randomize T AND M, measure Y
+
+```{r parallel-design-simulation}
+# Simulate parallel design data
+set.seed(2024)
+n <- 1000
+
+parallel_data <- tibble(
+  treat = rbinom(n, 1, 0.5),
+  manipulated = rep(c(0, 1), each = n/2),
+  
+  # Latent mediator
+  m_latent = case_when(
+    manipulated == 0 ~ rnorm(n, mean = treat * 0.5, sd = 1),  # Natural
+    manipulated == 1 ~ rnorm(n, mean = 0, sd = 1)              # Randomized
+  ),
+  
+  # Binary mediator
+  mediator = as.integer(m_latent > 0)
+) %>%
+  mutate(
+    # Binary outcome with logit link
+    p = plogis(-0.2 + 0.3 * treat + 0.4 * mediator),
+    outcome = rbinom(n(), 1, p)
+  ) %>%
+  dplyr::select(-p, -m_latent)
+
+# Parallel design analysis
+med_pd <- mediate.pd(
+  outcome     = "outcome",
+  mediator    = "mediator",
+  treat       = "treat",
+  manipulated = "manipulated",
+  data        = as.data.frame(parallel_data),
+  NINT        = TRUE,      # No treatment-mediator interaction
+  sims        = 500,
+  conf.level  = 0.95
+)
+
+summary(med_pd)
+
+
+
+# Standard mediation (only on non-manipulated observations)
+# Assumes sequential ignorability
+
+standard_data <- parallel_data %>% filter(manipulated == 0)
+
+med_standard <- mediate(
+  glm(mediator ~ treat, family = binomial, data = standard_data),
+  glm(outcome ~ treat + mediator, family = binomial, data = standard_data),
+  treat = "treat",
+  mediator = "mediator",
+  boot = TRUE,
+  sims = 500
+)
+
+cat("\n=== STANDARD MEDIATION (Sequential Ignorability) ===\n")
+summary(med_standard)
+
+cat("\n\n=== PARALLEL DESIGN (Weaker Assumptions) ===\n")
+summary(med_pd)
+```
+
+### Visualize Results
+
+```{r parallel-design-visualize}
+
+parallel_data %>%
+  group_by(treat, mediator, manipulated) %>%
+  summarize(
+    n = n(),
+    mean_outcome = mean(outcome),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    arm = ifelse(manipulated == 0, "Standard Arm\n(M natural)", 
+                 "Parallel Arm\n(M randomized)")
+  ) %>%
+  ggplot(aes(x = factor(treat), y = mean_outcome, fill = factor(mediator))) +
+  geom_col(position = "dodge", alpha = 0.7) +
+  facet_wrap(~arm) +
+  scale_fill_manual(values = c("0" = "#E74C3C", "1" = "#3498DB"),
+                    labels = c("M = 0", "M = 1")) +
+  labs(
+    title = "Parallel Design Structure",
+    x = "Treatment",
+    y = "Pr(Outcome = 1)",
+    fill = "Mediator"
+  )
+
+```
+
+
+## Further Practice
+
+### Exercise 1: Different Mediator
+Try using `job_dich` (dichotomous job search) as the mediator instead of `job_seek`.
+
+```{r exercise1, eval=FALSE}
+
+med_model_2 <- lm(job_dich ~ treat + depress1  + sex +age+ occp + marital + nonwhite + educ + income, 
+                  data = jobs)
+out_model_2 <- lm(depress2 ~ treat + job_dich + depress1  + sex +age+ occp + marital + nonwhite + educ + income, 
+                  data = jobs)
+
+med_results_2 <- mediate(med_model_2, out_model_2, 
+                         treat = "treat", mediator = "job_dich",
+                         boot = TRUE, sims = 1000)
+summary(med_results_2)
+```
+
+### Exercise 2: Multiple Mediators
+How would you analyze the case where both `job_seek` and `depress1` are mediators? (Hint: See Imai & Yamamoto 2013 on multiple mediators)
+
+### Exercise 3: Sensitivity Thresholds
+Calculate the R² thresholds at which your conclusions would change. How plausible are unmeasured confounders of that magnitude?
+
+
+
+## References
+
+- Imai, K., Keele, L., & Yamamoto, T. (2010). Identification, inference and sensitivity analysis for causal mediation effects. *Statistical Science*, 25(1), 51-71.
+
+- Imai, K., Keele, L., Tingley, D., & Yamamoto, T. (2011). Unpacking the black box of causality: Learning about causal mechanisms from experimental and observational studies. *American Political Science Review*, 105(4), 765-789.
+
+- Imai, K., Tingley, D., & Yamamoto, T. (2013). Experimental designs for identifying causal mechanisms. *Journal of the Royal Statistical Society: Series A*, 176(1), 5-51.
+
+- Bullock, J. G., & Green, D. P. (2021). The failings of conventional mediation analysis and a design-based alternative. *Advances in Methods and Practices in Psychological Science*, 4(4).
+
+- Tingley, D., Yamamoto, T., Hirose, K., Keele, L., & Imai, K. (2014). mediation: R package for causal mediation analysis. *Journal of Statistical Software*, 59(5), 1-38.
+
+---
+
+**Package versions used:**
+```{r session-info}
+sessionInfo()
+```
