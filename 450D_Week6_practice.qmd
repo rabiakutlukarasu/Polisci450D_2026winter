@@ -1,0 +1,836 @@
+---
+title: "450D Section — Week 6 Replication & Extension: Hainmueller & Hopkins (2015)"
+subtitle: "The Hidden American Immigration Consensus — Conjoint Analysis"
+author: "Rabia Kutlu Karasu"
+date: today
+format:
+  html:
+    toc-depth: 3
+    code-fold: false
+    theme: cosmo
+    highlight-style: github
+    fig-width: 9
+    fig-height: 7
+    embed-resources: true
+    self-contained: true
+execute:
+  warning: false
+  message: false
+pdf:
+    toc: true
+    number-sections: true
+---
+
+```{r setup Packages}
+library(tidyverse)
+library(haven)        # read Stata .dta
+library(estimatr)     # lm_robust with cluster-robust SEs
+library(broom)        # tidy model output
+library(patchwork)    # combine plots
+library(knitr)        # tables
+library(kableExtra)   # nice tables
+library(cjoint)
+
+theme_set(theme_bw(base_size = 13))
+```
+
+# 1 Introduction
+
+This document replicates and extends the conjoint analysis in **Hainmueller & Hopkins (2015)**, "The Hidden American Immigration Consensus: A Conjoint Analysis of Attitudes toward Immigrants," *AJPS* 59(3): 529–548.
+
+The study uses a conjoint experiment in which respondents evaluate pairs of hypothetical immigrant profiles described by **nine randomly assigned attributes** and choose which immigrant they would prefer to admit to the United States. The key estimand is the **Average Marginal Component Effect (AMCE)**: the average causal effect of changing one attribute level (relative to a baseline) on the probability that a profile is chosen, marginalizing over all other attributes.
+
+The replication data is available at Harvard Dataverse:
+DOI: 10.7910/DVN/25505
+URL: https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/25505
+
+```{r load-data}
+setwd("/Users/rabiakutlu/Downloads/dataverse_files-2")
+repdata <- haven::read_dta("repdata.dta")
+
+# Convert labeled Stata variables to factors preserving order
+df <- repdata %>%
+  mutate(across(where(is.labelled), as_factor))
+
+glimpse(df)
+```
+
+```{r data-summary}
+cat("Respondents:", n_distinct(df$CaseID), "\n")
+cat("Observations:", nrow(df), "\n")
+cat("Choice tasks per respondent:", n_distinct(df$contest_no), "\n")
+cat("Profiles per task: 2 (paired design)\n")
+```
+
+## 2.1 Attribute levels
+
+The nine randomized immigrant attributes and their levels:
+
+```{r attribute-table}
+attr_info <- tribble(
+  ~Attribute,         ~Variable,      ~Levels, ~Baseline,
+  "Education",        "FeatEd",       7,       "No formal education",
+  "Gender",           "FeatGender",   2,       "female",
+  "Country of origin","FeatCountry",  10,      "Germany",
+  "Reason for app.",  "FeatReason",   3,       "Reunite with family",
+
+  "Occupation",       "FeatJob",      11,      "Janitor",
+  "Job experience",   "FeatExp",      4,       "No experience",
+  "Job plans",        "FeatPlans",    4,       "Contract w/ employer",
+  "Prior trips",      "FeatTrips",    5,       "Never been to U.S.",
+  "Language skills",  "FeatLang",     4,       "Fluent English"
+)
+
+kable(attr_info, caption = "Conjoint attributes") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 2.2 Outcome measures
+
+```{r outcomes-desc}
+#| fig-height: 4
+
+p1 <- ggplot(df, aes(x = factor(Chosen_Immigrant))) +
+  geom_bar(aes(y = after_stat(prop), group = 1), fill = "steelblue") +
+  labs(x = "Chosen Immigrant (forced-choice)", y = "Proportion") +
+  scale_y_continuous(labels = scales::percent)
+
+p2 <- ggplot(df, aes(x = Rating_Immigrant)) +
+  geom_bar(aes(y = after_stat(prop), group = 1), fill = "darkorange") +
+  labs(x = "Rating (1–7 scale)", y = "Proportion") +
+  scale_y_continuous(labels = scales::percent) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+
+p1 + p2 + plot_annotation(title = "Distribution of outcome variables")
+```
+
+
+# 3 Main Replication: AMCEs (Forced-Choice Outcome)
+
+We estimate AMCEs via OLS on the binary forced-choice outcome (`Chosen_Immigrant`) with cluster-robust standard errors at the respondent level. Under fully independent randomization, each attribute enters the regression additively and the coefficients have a causal interpretation as AMCEs (Hainmueller, Hopkins & Yamamoto 2014).
+
+## 3.1 Prepare factor baselines
+
+We set baselines to match the original paper. For each attribute, the first level of the ordered factor from the Stata file serves as the reference category. We explicitly relevel where needed.
+
+```{r set-baselines}
+# ── Define baseline levels (matching H&H 2015 Table 2) ───────────────────────
+df <- df %>%
+  mutate(
+    # Education: baseline = "No formal education"
+    FeatEd = fct_relevel(FeatEd, "No formal education"),
+    # Gender: baseline = "female"
+    FeatGender = fct_relevel(FeatGender, "female"),
+    # Country: baseline = "Germany" (first European country)
+    FeatCountry = fct_relevel(FeatCountry, "Germany"),
+    # Reason: baseline = "Reunite with family"
+    FeatReason = fct_relevel(FeatReason,
+      "Reunite with family members already in the U.S."),
+    # Job: baseline = "Janitor"
+    FeatJob = fct_relevel(FeatJob, "Janitor"),
+    # Experience: baseline = "No job training or prior experience"
+    FeatExp = fct_relevel(FeatExp, "No job training or prior experience"),
+    # Plans: baseline = "Has a contract with a U.S. employer"
+    FeatPlans = fct_relevel(FeatPlans, "Has a contract with a U.S. employer"),
+    # Trips: baseline = "Never been to the U.S."
+    FeatTrips = fct_relevel(FeatTrips, "Never been to the U.S."),
+    # Language: baseline = "fluent English"
+    FeatLang = fct_relevel(FeatLang,
+      levels(FeatLang)[str_detect(levels(FeatLang), "fluent")])
+  )
+```
+
+## 3.2 Estimate AMCEs via `lm_robust()`
+
+```{r amce-main}
+# ── Full AMCE regression ─────────────────────────────────────────────────────
+amce_fit <- lm_robust(
+  Chosen_Immigrant ~ FeatEd + FeatGender + FeatCountry + FeatReason +
+    FeatJob + FeatExp + FeatPlans + FeatTrips + FeatLang,
+  data = df,
+  clusters = CaseID,      # cluster SEs by respondent
+  se_type = "CR2"         # Bell-McCaffrey bias-reduced SEs
+)
+
+amce_tidy <- tidy(amce_fit) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    attribute = case_when(
+      str_starts(term, "FeatEd")      ~ "Education",
+      str_starts(term, "FeatGender")   ~ "Gender",
+      str_starts(term, "FeatCountry")  ~ "Country of Origin",
+      str_starts(term, "FeatReason")   ~ "Reason for Application",
+      str_starts(term, "FeatJob")      ~ "Occupation",
+      str_starts(term, "FeatExp")      ~ "Job Experience",
+      str_starts(term, "FeatPlans")    ~ "Job Plans",
+      str_starts(term, "FeatTrips")    ~ "Prior Trips to U.S.",
+      str_starts(term, "FeatLang")     ~ "Language Skills"
+    ),
+    # Clean level labels
+    level = str_remove(term, "^Feat(Ed|Gender|Country|Reason|Job|Exp|Plans|Trips|Lang)")
+  )
+```
+
+## 3.3 AMCE coefficient plot (Figure 2 replication)
+
+```{r amce-plot}
+#| fig-height: 12
+#| fig-width: 9
+
+# Order attributes for plot
+attr_order <- c("Education", "Gender", "Country of Origin",
+                "Reason for Application", "Occupation",
+                "Job Experience", "Job Plans",
+                "Prior Trips to U.S.", "Language Skills")
+
+amce_tidy <- amce_tidy %>%
+  mutate(attribute = factor(attribute, levels = rev(attr_order)))
+
+ggplot(amce_tidy, aes(x = estimate, y = fct_inorder(level))) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_pointrange(
+    aes(xmin = conf.low, xmax = conf.high),
+    size = 0.4, color = "steelblue"
+  ) +
+  facet_grid(attribute ~ ., scales = "free_y", space = "free_y",
+             switch = "y") +
+  labs(
+    title = "Average Marginal Component Effects on Pr(Chosen Immigrant)",
+    subtitle = "Replication of Hainmueller & Hopkins (2015), Figure 2",
+    x = "Change in Pr(Immigrant Preferred for Admission)",
+    y = NULL
+  ) +
+  theme(
+    strip.text.y.left = element_text(angle = 0, hjust = 1, face = "bold",
+                                      size = 10),
+    strip.placement = "outside",
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(size = 9)
+  )
+```
+
+## 3.4 Regression table
+
+```{r amce-table}
+amce_tidy %>%
+  select(Attribute = attribute, Level = level,
+         AMCE = estimate, SE = std.error,
+         `95% CI Low` = conf.low, `95% CI High` = conf.high,
+         `p-value` = p.value) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+  kable(caption = "AMCEs — Forced-choice outcome (Chosen_Immigrant)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), font_size = 12) %>%
+  pack_rows(index = table(amce_tidy$attribute))
+```
+
+
+# 4 AMCEs for Alternative Outcomes
+
+## 4.1 Binary support for admission
+
+```{r amce-support}
+amce_support <- lm_robust(
+  Support_Admission ~ FeatEd + FeatGender + FeatCountry + FeatReason +
+    FeatJob + FeatExp + FeatPlans + FeatTrips + FeatLang,
+  data = df,
+  clusters = CaseID,
+  se_type = "CR2"
+)
+
+tidy_support <- tidy(amce_support) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(outcome = "Support Admission")
+```
+
+## 4.2 Rating scale (rescaled 0–1)
+
+```{r amce-rating}
+# Recode 7-point rating to numeric 0–1
+df <- df %>%
+  mutate(
+    rating_num = as.numeric(Rating_Immigrant),
+    rating_01 = (rating_num - 1) / 6
+  )
+
+amce_rating <- lm_robust(
+  rating_01 ~ FeatEd + FeatGender + FeatCountry + FeatReason +
+    FeatJob + FeatExp + FeatPlans + FeatTrips + FeatLang,
+  data = df,
+  clusters = CaseID,
+  se_type = "CR2"
+)
+
+tidy_rating <- tidy(amce_rating) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(outcome = "Rating (0–1)")
+```
+
+## 4.3 Comparison across outcomes
+
+```{r compare-outcomes}
+#| fig-height: 11
+
+tidy_choice <- amce_tidy %>% mutate(outcome = "Forced Choice")
+
+compare_df <- bind_rows(
+  tidy_choice %>% select(term, estimate, conf.low, conf.high, attribute, level, outcome),
+  tidy_support %>%
+    mutate(
+      attribute = tidy_choice$attribute,
+      level = tidy_choice$level
+    ) %>%
+    select(term, estimate, conf.low, conf.high, attribute, level, outcome),
+  tidy_rating %>%
+    mutate(
+      attribute = tidy_choice$attribute,
+      level = tidy_choice$level
+    ) %>%
+    select(term, estimate, conf.low, conf.high, attribute, level, outcome)
+)
+
+compare_df <- compare_df %>%
+  mutate(attribute = factor(attribute, levels = rev(attr_order)))
+
+ggplot(compare_df, aes(x = estimate, y = fct_inorder(level),
+                       color = outcome, shape = outcome)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_pointrange(
+    aes(xmin = conf.low, xmax = conf.high),
+    position = position_dodge(width = 0.5), size = 0.3
+  ) +
+  facet_grid(attribute ~ ., scales = "free_y", space = "free_y",
+             switch = "y") +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    title = "AMCEs across three outcome measures",
+    x = "AMCE", y = NULL, color = "Outcome", shape = "Outcome"
+  ) +
+  theme(
+    strip.text.y.left = element_text(angle = 0, hjust = 1, face = "bold"),
+    strip.placement = "outside",
+    legend.position = "top"
+  )
+```
+
+
+# 5 Marginal Means
+
+Marginal means show the average predicted probability of being preferred for each attribute level, averaging over all other attributes. Unlike AMCEs, marginal means don't require choosing a baseline category — useful when the "natural" baseline is ambiguous (Leeper, Hobolt & Tilley 2020).
+
+```{r marginal-means}
+#| fig-height: 11
+
+# ── Compute marginal means per attribute level ────────────────────────────────
+compute_mm <- function(data, attr_var, outcome = "Chosen_Immigrant") {
+  data %>%
+    group_by(level = .data[[attr_var]]) %>%
+    summarise(
+      mm = mean(.data[[outcome]], na.rm = TRUE),
+      se = sd(.data[[outcome]], na.rm = TRUE) / sqrt(n()),
+      n = n(),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      attribute = attr_var,
+      ci_low = mm - 1.96 * se,
+      ci_high = mm + 1.96 * se
+    )
+}
+
+attrs <- c("FeatEd", "FeatGender", "FeatCountry", "FeatReason",
+           "FeatJob", "FeatExp", "FeatPlans", "FeatTrips", "FeatLang")
+
+attr_labels <- c("Education", "Gender", "Country of Origin",
+                 "Reason for Application", "Occupation",
+                 "Job Experience", "Job Plans",
+                 "Prior Trips to U.S.", "Language Skills")
+
+mm_df <- map2_dfr(attrs, attr_labels, function(a, lab) {
+  compute_mm(df, a) %>% mutate(attribute = lab)
+})
+
+mm_df <- mm_df %>%
+  mutate(attribute = factor(attribute, levels = rev(attr_order)))
+
+ggplot(mm_df, aes(x = mm, y = fct_inorder(level))) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "gray50") +
+  geom_pointrange(
+    aes(xmin = ci_low, xmax = ci_high),
+    size = 0.4, color = "darkgreen"
+  ) +
+  facet_grid(attribute ~ ., scales = "free_y", space = "free_y",
+             switch = "y") +
+  labs(
+    title = "Marginal Means: Pr(Chosen Immigrant) by attribute level",
+    x = "Marginal Mean (Pr of being preferred)",
+    y = NULL
+  ) +
+  theme(
+    strip.text.y.left = element_text(angle = 0, hjust = 1, face = "bold"),
+    strip.placement = "outside"
+  )
+```
+
+
+# 6 Conditional AMCEs by Respondent Subgroups
+
+A core extension: do immigration preferences differ across respondent types? We estimate AMCEs separately by **party identification** and by **ethnocentrism** (proxied by the feeling thermometer W1_Q8a).
+
+## 6.1 By party identification
+
+```{r conditional-party}
+#| fig-height: 14
+
+# ── Collapse party to 3 groups ───────────────────────────────────────────────
+df <- df %>%
+  mutate(
+    party3 = case_when(
+      Party_ID %in% c("Strong Democrat", "Not Strong Democrat",
+                       "Leans Democrat") ~ "Democrat",
+      Party_ID %in% c("Strong Republican", "Not Strong Republican",
+                       "Leans Republican") ~ "Republican",
+      TRUE ~ "Independent/Other"
+    )
+  )
+
+# ── Estimate AMCEs separately by party ───────────────────────────────────────
+estimate_amce_by <- function(data, group_var, group_val) {
+  sub <- data %>% filter(.data[[group_var]] == group_val)
+  fit <- lm_robust(
+    Chosen_Immigrant ~ FeatEd + FeatGender + FeatCountry + FeatReason +
+      FeatJob + FeatExp + FeatPlans + FeatTrips + FeatLang,
+    data = sub,
+    clusters = CaseID,
+    se_type = "CR2"
+  )
+  tidy(fit) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(group = group_val)
+}
+
+party_amces <- map_dfr(c("Democrat", "Republican", "Independent/Other"),
+                        ~ estimate_amce_by(df, "party3", .x))
+
+# Add attribute labels
+party_amces <- party_amces %>%
+  mutate(
+    attribute = case_when(
+      str_starts(term, "FeatEd")      ~ "Education",
+      str_starts(term, "FeatGender")   ~ "Gender",
+      str_starts(term, "FeatCountry")  ~ "Country of Origin",
+      str_starts(term, "FeatReason")   ~ "Reason for Application",
+      str_starts(term, "FeatJob")      ~ "Occupation",
+      str_starts(term, "FeatExp")      ~ "Job Experience",
+      str_starts(term, "FeatPlans")    ~ "Job Plans",
+      str_starts(term, "FeatTrips")    ~ "Prior Trips to U.S.",
+      str_starts(term, "FeatLang")     ~ "Language Skills"
+    ),
+    level = str_remove(term, "^Feat(Ed|Gender|Country|Reason|Job|Exp|Plans|Trips|Lang)"),
+    attribute = factor(attribute, levels = rev(attr_order))
+  )
+
+ggplot(party_amces, aes(x = estimate, y = fct_inorder(level),
+                         color = group, shape = group)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_pointrange(
+    aes(xmin = conf.low, xmax = conf.high),
+    position = position_dodge(width = 0.6), size = 0.3
+  ) +
+  facet_grid(attribute ~ ., scales = "free_y", space = "free_y",
+             switch = "y") +
+  scale_color_manual(values = c("Democrat" = "blue3",
+                                 "Republican" = "red3",
+                                 "Independent/Other" = "gray40")) +
+  labs(
+    title = "Conditional AMCEs by Party Identification",
+    subtitle = "Do Democrats and Republicans weight immigrant attributes differently?",
+    x = "AMCE", y = NULL, color = "Party", shape = "Party"
+  ) +
+  theme(
+    strip.text.y.left = element_text(angle = 0, hjust = 1, face = "bold",
+                                      size = 9),
+    strip.placement = "outside",
+    legend.position = "top"
+  )
+```
+
+## 6.2 By ethnocentrism (high vs. low)
+
+```{r conditional-ethno}
+#| fig-height: 14
+
+# W1_Q8a = feeling thermometer toward co-ethnics (higher = warmer in-group)
+# Median split
+df <- df %>%
+  mutate(
+    ethno_high = if_else(W1_Q8a >= median(W1_Q8a, na.rm = TRUE),
+                         "High Ethnocentrism", "Low Ethnocentrism")
+  )
+
+ethno_amces <- map_dfr(c("High Ethnocentrism", "Low Ethnocentrism"),
+                        ~ estimate_amce_by(df, "ethno_high", .x))
+
+ethno_amces <- ethno_amces %>%
+  mutate(
+    attribute = case_when(
+      str_starts(term, "FeatEd")      ~ "Education",
+      str_starts(term, "FeatGender")   ~ "Gender",
+      str_starts(term, "FeatCountry")  ~ "Country of Origin",
+      str_starts(term, "FeatReason")   ~ "Reason for Application",
+      str_starts(term, "FeatJob")      ~ "Occupation",
+      str_starts(term, "FeatExp")      ~ "Job Experience",
+      str_starts(term, "FeatPlans")    ~ "Job Plans",
+      str_starts(term, "FeatTrips")    ~ "Prior Trips to U.S.",
+      str_starts(term, "FeatLang")     ~ "Language Skills"
+    ),
+    level = str_remove(term, "^Feat(Ed|Gender|Country|Reason|Job|Exp|Plans|Trips|Lang)"),
+    attribute = factor(attribute, levels = rev(attr_order))
+  )
+
+ggplot(ethno_amces, aes(x = estimate, y = fct_inorder(level),
+                         color = group, shape = group)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_pointrange(
+    aes(xmin = conf.low, xmax = conf.high),
+    position = position_dodge(width = 0.5), size = 0.3
+  ) +
+  facet_grid(attribute ~ ., scales = "free_y", space = "free_y",
+             switch = "y") +
+  scale_color_manual(values = c("High Ethnocentrism" = "firebrick",
+                                 "Low Ethnocentrism" = "dodgerblue")) +
+  labs(
+    title = "Conditional AMCEs by Ethnocentrism",
+    x = "AMCE", y = NULL, color = NULL, shape = NULL
+  ) +
+  theme(
+    strip.text.y.left = element_text(angle = 0, hjust = 1, face = "bold",
+                                      size = 9),
+    strip.placement = "outside",
+    legend.position = "top"
+  )
+```
+
+## 6.3 Formal interaction test (Party × Country of Origin)
+
+```{r interaction-party-country}
+# ── Test whether country-of-origin AMCEs differ by party ─────────────────────
+df <- df %>%
+  mutate(republican = if_else(party3 == "Republican", 1, 0))
+
+int_fit <- lm_robust(
+  Chosen_Immigrant ~ FeatEd + FeatGender + FeatCountry * republican +
+    FeatReason + FeatJob + FeatExp + FeatPlans + FeatTrips + FeatLang,
+  data = df %>% filter(party3 %in% c("Democrat", "Republican")),
+  clusters = CaseID,
+  se_type = "CR2"
+)
+
+# Extract interaction terms
+int_terms <- tidy(int_fit) %>%
+  filter(str_detect(term, ":republican")) %>%
+  mutate(
+    level = str_remove(term, "FeatCountry") %>% str_remove(":republican")
+  ) %>%
+  select(level, estimate, std.error, conf.low, conf.high, p.value)
+
+kable(int_terms, digits = 4,
+      caption = "Interaction: Country × Republican (difference in AMCEs)") %>%
+  kable_styling(bootstrap_options = c("striped"), full_width = FALSE)
+```
+
+
+# 7 Interaction Effects between Immigrant Attributes
+
+Do the effects of one attribute depend on the level of another? We test the interaction between **education** and **country of origin** — does having higher education matter more for immigrants from lower-income countries?
+
+```{r attr-interaction}
+#| fig-height: 8
+
+# ── Collapse education to binary for clarity ─────────────────────────────────
+df <- df %>%
+  mutate(
+    ed_high = if_else(
+      FeatEd %in% c("Equivalent to completing a college degree in the US",
+                     "Equivalent to completing a graduate degree in the US"),
+      "College+", "Less than college"
+    )
+  )
+
+# ── Estimate AMCEs for country conditional on education level ────────────────
+cond_country_ed <- map_dfr(c("College+", "Less than college"), function(ed) {
+  sub <- df %>% filter(ed_high == ed)
+  fit <- lm_robust(
+    Chosen_Immigrant ~ FeatCountry,
+    data = sub,
+    clusters = CaseID,
+    se_type = "CR2"
+  )
+  tidy(fit) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(
+      education = ed,
+      country = str_remove(term, "FeatCountry")
+    )
+})
+
+ggplot(cond_country_ed, aes(x = estimate, y = fct_inorder(country),
+                             color = education)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_pointrange(
+    aes(xmin = conf.low, xmax = conf.high),
+    position = position_dodge(width = 0.5), size = 0.5
+  ) +
+  scale_color_manual(values = c("College+" = "darkblue",
+                                 "Less than college" = "orange3")) +
+  labs(
+    title = "Country-of-origin effects conditional on education level",
+    subtitle = "Does having a college degree offset country-of-origin penalties?",
+    x = "Effect on Pr(Chosen) relative to Germany",
+    y = NULL, color = "Education"
+  ) +
+  theme(legend.position = "top")
+```
+
+```{r interaction-formal}
+# ── Formal interaction test: Education × Country ─────────────────────────────
+int_ed_country <- lm_robust(
+  Chosen_Immigrant ~ FeatEd * FeatCountry + FeatGender + FeatReason +
+    FeatJob + FeatExp + FeatPlans + FeatTrips + FeatLang,
+  data = df,
+  clusters = CaseID,
+  se_type = "CR2"
+)
+
+# Joint F-test of interaction terms
+int_coefs <- tidy(int_ed_country) %>%
+  filter(str_detect(term, "FeatEd.*:FeatCountry|FeatCountry.*:FeatEd"))
+
+cat("Number of interaction terms:", nrow(int_coefs), "\n")
+cat("Significant interactions (p < 0.05):", sum(int_coefs$p.value < 0.05), "\n")
+```
+
+
+# 8 Diagnostics
+
+## 8.1 Profile-order effects
+
+Do respondents systematically favor the left/first profile? Under random assignment, profile order should not predict choices.
+
+```{r profile-order}
+# In paired conjoint, each row is one profile. If contest_no × position is
+# balanced, we check whether odd-row profiles are chosen more often.
+# The data has 2 rows per choice task; the first row = profile 1.
+
+df <- df %>%
+  group_by(CaseID, contest_no) %>%
+  mutate(profile_position = row_number()) %>%
+  ungroup()
+
+profile_order_test <- lm_robust(
+  Chosen_Immigrant ~ factor(profile_position),
+  data = df,
+  clusters = CaseID,
+  se_type = "CR2"
+)
+
+cat("Profile-order effect:\n")
+tidy(profile_order_test) %>%
+  filter(term != "(Intercept)") %>%
+  select(term, estimate, std.error, p.value) %>%
+  kable(digits = 4) %>%
+  print()
+```
+
+## 8.2 Carryover effects (task-order)
+
+Do AMCEs change across the five choice tasks? Fatigue or learning effects could bias later tasks.
+
+```{r carryover}
+#| fig-height: 6
+
+# ── Estimate AMCEs separately by task number ─────────────────────────────────
+task_amces <- map_dfr(1:5, function(t) {
+  sub <- df %>% filter(contest_no == t)
+  fit <- lm_robust(
+    Chosen_Immigrant ~ FeatEd + FeatGender + FeatCountry + FeatReason +
+      FeatJob + FeatExp + FeatPlans + FeatTrips + FeatLang,
+    data = sub,
+    clusters = CaseID,
+    se_type = "CR2"
+  )
+  tidy(fit) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(task = t)
+})
+
+# Plot a few key attributes across tasks
+key_terms <- c(
+  "FeatEdEquivalent to completing a college degree in the US",
+  "FeatCountryMexico",
+  "FeatCountryIraq",
+  "FeatJobDoctor"
+)
+
+task_amces %>%
+  filter(term %in% key_terms) %>%
+  mutate(label = str_remove(term, "^Feat(Ed|Country|Job)")) %>%
+  ggplot(aes(x = task, y = estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+  geom_line() +
+  geom_point(size = 2) +
+  facet_wrap(~ label, scales = "free_y") +
+  labs(
+    title = "Stability of AMCEs across choice tasks (carryover diagnostic)",
+    x = "Task number", y = "AMCE"
+  )
+```
+
+## 8.3 Balance check: covariate independence
+
+Under proper randomization, respondent covariates should not predict attribute assignments.
+
+```{r balance-check}
+# ── Test whether respondent age predicts education assignment ────────────────
+df <- df %>% mutate(ppage_num = as.numeric(as.character(ppage)))
+
+bal_test <- lm_robust(
+  ppage_num ~ FeatEd + FeatGender + FeatCountry + FeatReason +
+    FeatJob + FeatExp + FeatPlans + FeatTrips + FeatLang,
+  data = df,
+  clusters = CaseID,
+  se_type = "CR2"
+)
+
+bal_pvals <- tidy(bal_test) %>%
+  filter(term != "(Intercept)") %>%
+  pull(p.value)
+
+cat("Balance check: respondent age ~ all attribute dummies\n")
+cat("Min p-value:", round(min(bal_pvals), 4), "\n")
+cat("Share significant at 5%:", round(mean(bal_pvals < 0.05), 3), "\n")
+cat("(Expected under null: 0.05)\n")
+```
+
+
+# 9 Extensions
+
+## 9.1 Optimal immigrant profile
+
+What profile maximizes predicted admission probability? Under additive AMCEs, the optimal profile selects the level with the highest marginal mean for each attribute.
+
+```{r optimal-profile}
+optimal <- mm_df %>%
+  group_by(attribute) %>%
+  slice_max(mm, n = 1) %>%
+  ungroup() %>%
+  select(Attribute = attribute, `Optimal Level` = level,
+         `Marginal Mean` = mm) %>%
+  arrange(desc(`Marginal Mean`))
+
+kable(optimal, digits = 3,
+      caption = "Optimal immigrant profile (highest marginal mean per attribute)") %>%
+  kable_styling(bootstrap_options = c("striped"), full_width = FALSE)
+```
+
+## 9.2 Least-preferred immigrant profile
+
+```{r worst-profile}
+worst <- mm_df %>%
+  group_by(attribute) %>%
+  slice_min(mm, n = 1) %>%
+  ungroup() %>%
+  select(Attribute = attribute, `Least Preferred Level` = level,
+         `Marginal Mean` = mm) %>%
+  arrange(`Marginal Mean`)
+
+kable(worst, digits = 3,
+      caption = "Least-preferred immigrant profile") %>%
+  kable_styling(bootstrap_options = c("striped"), full_width = FALSE)
+```
+
+## 9.3 Respondent-level heterogeneity in AMCEs
+
+We use a simple respondent-level regression approach: for each respondent, estimate the within-respondent effect of college education on choice, then examine the distribution.
+
+```{r heterogeneity}
+#| fig-height: 5
+
+# ── Respondent-level estimates for education ─────────────────────────────────
+df <- df %>%
+  mutate(ed_college = if_else(ed_high == "College+", 1, 0))
+
+resp_effects <- df %>%
+  group_by(CaseID) %>%
+  summarise(
+    mean_chosen_college = mean(Chosen_Immigrant[ed_college == 1], na.rm = TRUE),
+    mean_chosen_nocollege = mean(Chosen_Immigrant[ed_college == 0], na.rm = TRUE),
+    ite = mean_chosen_college - mean_chosen_nocollege,
+    party = first(party3),
+    .groups = "drop"
+  ) %>%
+  filter(!is.nan(ite))
+
+p1 <- ggplot(resp_effects, aes(x = ite)) +
+  geom_histogram(bins = 40, fill = "steelblue", alpha = 0.7) +
+  geom_vline(xintercept = mean(resp_effects$ite, na.rm = TRUE),
+             color = "red", linetype = "dashed") +
+  labs(title = "Distribution of respondent-level education effects",
+       x = "Within-respondent effect of college education on choice",
+       y = "Count")
+
+p2 <- ggplot(resp_effects, aes(x = party, y = ite, fill = party)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_manual(values = c("Democrat" = "blue3",
+                                "Republican" = "red3",
+                                "Independent/Other" = "gray60")) +
+  labs(title = "Education effect by party",
+       x = NULL, y = "Respondent-level education effect") +
+  theme(legend.position = "none")
+
+p1 + p2
+```
+
+## 9.4 Comparison with `cjoint` package (optional)
+
+If you have the `cjoint` package installed, you can verify results:
+
+```{r cjoint-comparison, fig.width=25, fig.height=10}
+
+library(cjoint)
+
+# Prepare formula
+f <- Chosen_Immigrant ~ FeatEd + FeatGender + FeatCountry + FeatReason +
+  FeatJob + FeatExp + FeatPlans + FeatTrips + FeatLang
+
+df2 <- df[!is.na(df$Chosen_Immigrant), ]
+
+# AMCE estimation via cjoint
+cj_result <- amce(
+  f,
+  data = as.data.frame(df2),
+  cluster = TRUE,
+  respondent.id = "CaseID"
+)
+
+
+summary(cj_result)
+plot(cj_result)
+```
+
+
+---
+
+# Appendix: Technical Notes
+
+**Identification.** Under fully independent randomization of all attribute levels across profiles (the design used in H&H 2015), the AMCE is nonparametrically identified as a simple difference in means and can be estimated by OLS. Cluster-robust standard errors account for within-respondent correlation across tasks and within-task correlation across profiles.
+
+**Baselines.** AMCE estimates are relative to the omitted baseline category for each attribute. The magnitude and sign of estimates change with different baselines, but differences between any two levels are invariant.
+
+**Marginal means** complement AMCEs by providing an absolute measure (predicted probability) rather than a relative one. They are especially useful when there is no natural baseline category.
+
+**Weighted estimation.** For survey-weighted AMCEs, replace `lm_robust()` calls with `weights = weight2` to incorporate the survey weights provided in the data.
+
+```{r session-info}
+sessionInfo()
+```
