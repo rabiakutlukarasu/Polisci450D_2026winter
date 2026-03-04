@@ -55,7 +55,7 @@ library(dplyr)
 library(kableExtra)
 library(tidyr)
 
-#download the date from here: https://www.openicpsr.org/openicpsr/project/113593/version/V1/view
+#download the data from here: https://www.openicpsr.org/openicpsr/project/113593/version/V1/view
 
 # ── Load raw data files ──────────────────────────────────────────────────────
 survey <- read_dta("113593-V1/data/data/0422survey.dta")
