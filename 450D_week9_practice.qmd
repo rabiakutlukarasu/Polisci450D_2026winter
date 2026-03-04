@@ -1,0 +1,646 @@
+---
+title: "Week 9 TA Section: Interference and Spillover Effects"
+subtitle: "Application with Cai, De Janvry & Sadoulet (2015)"
+author: "Rabia Kutlu Karasu"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-summary: "Show code"
+    self-contained: true
+    fig-width: 8
+    fig-height: 5
+    theme: cosmo
+    highlight-style: github
+  pdf:
+    toc: true
+    number-sections: true
+execute:
+  warning: false
+  message: false
+---
+
+## Overview
+
+This section accompanies the Week 9 readings on **interference** (violations of SUTVA). We work through an empirical replication using the original data from:
+
+> **Cai, Jing, Alain De Janvry, and Elisabeth Sadoulet. 2015. "Social Networks and the Decision to Insure." *American Economic Journal: Applied Economics* 7(2): 81--108.**
+
+The data consist of three raw files that we assemble ourselves:
+
+- `0422survey.dta` — household-level survey and treatment assignment (4,902 obs)
+- `0422allinforawnet.dta` — long-format raw network nominations (23,243 obs)
+- `0422structure_all.dta` — UCINET-computed network structural measures (4,661 obs)
+
+The key methodological frameworks are:
+
+- **Hudgens & Halloran (2008)**: Partial interference — spillovers operate within but not across groups
+- **Aronow & Samii (2017)**: General interference via exposure mappings
+- **Wang et al. (forthcoming)**: Design-based inference for spatial experiments under *unknown* interference
+
+
+## Setup
+
+```{r setup}
+# install.packages(c("haven", "fixest", "modelsummary",
+#                    "ggplot2", "dplyr", "kableExtra", "tidyr"))
+
+library(haven)         # Read Stata .dta files
+library(fixest)        # Fixed effects estimation, clustered SEs
+library(modelsummary)  # Regression tables
+library(ggplot2)
+library(dplyr)
+library(kableExtra)
+library(tidyr)
+
+#download the date from here: https://www.openicpsr.org/openicpsr/project/113593/version/V1/view
+
+# ── Load raw data files ──────────────────────────────────────────────────────
+survey <- read_dta("113593-V1/data/data/0422survey.dta")
+rawnet <- read_dta("113593-V1/data/data/0422allinforawnet.dta")
+struct <- read_dta("113593-V1/data/data/0422structure_all.dta")
+```
+
+
+## Part 1: The Experimental Design and SUTVA
+
+### 1.1 Understanding the Setting
+
+Rice farmers in rural China were offered weather insurance by the People's Insurance Company of China (PICC). The experiment had **two levels of randomization**:
+
+**Household-level randomization**: Each farmer was assigned to a first-round (`delay == 0`) or second-round (`delay == 1`) information session. Within each round, farmers were further randomly assigned to:
+
+- **Simple** session (`intensive == 0`): 20-minute overview
+- **Intensive** session (`intensive == 1`): 3-hour detailed financial education
+
+**Village-level randomization**: 185 villages were assigned to Type I (no price variation) or Type II (price variation). Type I villages were further split by default option: Type IA (default = buy) vs. Type IB (default = not buy).
+
+**The identification strategy**: For second-round participants, the *share of their named friends who received a first-round intensive session* is exogenously determined by the randomization. This is the `network_rate_preintensive` variable we construct below.
+
+### SUTVA Violation by Design
+
+Under SUTVA, farmer $i$'s potential outcome depends only on their own treatment:
+$$Y_i(d) \quad \text{for } d \in \{0,1\}$$
+
+Here, the full potential outcome (as shown in the class slides) is:
+$$Y_i = Y_i(d_{fi}^1,\ d_{fi}^2,\ d_{fi}^3,\ d_{fi}^4,\ d_{fi}^5,\ D_i)$$
+
+where $d_{fi}^k$ is the first-round treatment of friend $k$ (up to 5 named friends) and $D_i$ is household $i$'s own second-round treatment. The experiment is *designed* to detect and estimate this dependence.
+
+
+### 1.2 Constructing Network Variables from Raw Data
+
+The `causaldata` package's `social_insure` dataset does **not** include the network variable. We build it from scratch, replicating the Stata `rawnet.do` construction exactly.
+
+```{r build-network-vars}
+# ── Step 1: Drop households with missing names AND missing network_id ─────────
+rawnet_clean <- rawnet |>
+  filter(!(network_missname == 1 & is.na(network_id)))
+
+# ── Step 2: Build household-level network variables ───────────────────────────
+network_vars <- rawnet_clean |>
+  group_by(id) |>
+  summarise(
+    network_obs              = n(),
+    network_sum_preintensive = sum(delay == 0 & intensive == 1, na.rm = TRUE),
+    network_sum_presession   = sum(delay == 0, na.rm = TRUE),
+    network_sum_pretakeup    = sum(delay == 0 & takeup_survey == 1, na.rm = TRUE),
+    flag_sum                 = sum(delay == 0 & !is.na(takeup_survey), na.rm = TRUE),
+    knowledge_network        = mean(understanding[delay == 0], na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    # Primary spillover variable (Equation 3 in paper)
+    network_rate_preintensive = network_sum_preintensive / network_obs,
+    network_rate_presession   = network_sum_presession   / network_obs,
+    network_rate_pretakeup    = ifelse(flag_sum > 0,
+                                       network_sum_pretakeup / network_sum_presession,
+                                       NA_real_),
+    network_rate_presimple    = network_rate_presession - network_rate_preintensive,
+    # Count-based dummies
+    number_preintensive = network_rate_preintensive * network_obs,
+    network_onlyone     = as.integer(number_preintensive == 1),
+    network_onlytwo     = as.integer(number_preintensive == 2),
+    network_twomore     = as.integer(!is.na(number_preintensive) & number_preintensive > 1),
+    network_yes         = as.integer(network_rate_preintensive > 0),
+    # Network size dummies
+    friend1 = as.integer(network_obs == 1),
+    friend2 = as.integer(network_obs == 2),
+    friend3 = as.integer(network_obs == 3),
+    friend4 = as.integer(network_obs == 4),
+    friend5 = as.integer(network_obs == 5)
+  )
+
+# ── Step 3: Average structural characteristics of friends ─────────────────────
+struct_friends <- rawnet_clean |>
+  left_join(struct, by = c("network_id" = "id")) |>
+  group_by(id) |>
+  summarise(
+    mean_allnetindegree       = mean(indegree,     na.rm = TRUE),
+    mean_allnetpath_out_ind   = mean(path_out_ind, na.rm = TRUE),
+    mean_allneteigenvector    = mean(eigenvector,  na.rm = TRUE),
+    mean_1steduc_indegree     = mean(indegree[delay == 0 & intensive == 1],      na.rm = TRUE),
+    mean_1steduc_path_out_ind = mean(path_out_ind[delay == 0 & intensive == 1],  na.rm = TRUE),
+    mean_1steduc_eigenvector  = mean(eigenvector[delay == 0 & intensive == 1],   na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(across(starts_with("mean_"), ~replace_na(.x, 0)))
+
+# ── Step 4: Assemble analysis dataset ─────────────────────────────────────────
+df <- survey |>
+  left_join(network_vars,  by = "id") |>
+  left_join(struct_friends, by = "id") |>
+  left_join(struct,         by = "id") |>
+  mutate(village = as.factor(village))
+
+cat("Analysis dataset:", nrow(df), "households,", ncol(df), "variables\n")
+cat("network_rate_preintensive available for:",
+    sum(!is.na(df$network_rate_preintensive)), "households\n")
+```
+
+### 1.3 Data Overview
+
+```{r data-overview}
+summary_df <- df |>
+  summarise(
+    N                               = n(),
+    `Take-up Rate`                  = mean(takeup_survey, na.rm = TRUE),
+    `Mean Age`                      = mean(age, na.rm = TRUE),
+    `Mean HH Size`                  = mean(agpop, na.rm = TRUE),
+    `Share Male HH Head`            = mean(male, na.rm = TRUE),
+    `Share Literate`                = mean(literacy, na.rm = TRUE),
+    `Mean Rice Area (mu)`           = mean(ricearea_2010, na.rm = TRUE),
+    `Mean Disaster Prob`            = mean(disaster_prob, na.rm = TRUE),
+    `Share Intensive Session`       = mean(intensive, na.rm = TRUE),
+    `Share Default = Buy`           = mean(default, na.rm = TRUE),
+    `Mean Risk Aversion`            = mean(risk_averse, na.rm = TRUE),
+    `Network Size (mean # friends)` = mean(network_obs, na.rm = TRUE),
+    `Mean Network Rate (Intensive)` = mean(network_rate_preintensive, na.rm = TRUE)
+  ) |>
+  pivot_longer(everything(), names_to = "Variable", values_to = "Value")
+
+kable(summary_df, digits = 3, caption = "Table 1: Summary Statistics") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### 1.4 Randomization Check
+
+```{r balance-check}
+balance_vars <- c("age", "agpop", "ricearea_2010", "disaster_yes",
+                  "disaster_loss", "male", "educ")
+
+balance_table <- df |>
+  group_by(intensive) |>
+  summarise(across(all_of(balance_vars), ~mean(.x, na.rm = TRUE)),
+            N = n(), .groups = "drop") |>
+  mutate(intensive = ifelse(intensive == 1, "Intensive", "Simple"))
+
+balance_long <- balance_table |>
+  pivot_longer(-intensive, names_to = "Variable", values_to = "Mean") |>
+  pivot_wider(names_from = intensive, values_from = Mean)
+
+pvals <- sapply(balance_vars, function(v) {
+  t.test(df[[v]][df$intensive == 1], df[[v]][df$intensive == 0])$p.value
+})
+balance_long_vars <- balance_long |> filter(Variable != "N")
+balance_long_vars$`p-value` <- round(pvals[balance_long_vars$Variable], 3)
+
+kable(balance_long_vars, digits = 3,
+      caption = "Table A1: Balance Check — Intensive vs. Simple Session") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+
+## Part 2: Connecting to the Interference Frameworks
+
+### 2.1 Hudgens & Halloran (2008): Partial Interference
+
+Hudgens & Halloran assume units can be partitioned into groups such that interference operates *within* but not *across* groups. In Cai et al.:
+
+- **Groups** = villages (`village` variable)
+- **Individual treatment** $D_i$ = assignment to intensive session
+- **Partial interference assumption**: spillovers from farmers in *other* villages are zero
+
+Under partial interference, the key estimands are:
+
+$$\text{Direct Effect:}\quad DE(\pi) = E[Y_i(1,\pi) - Y_i(0,\pi)]$$
+$$\text{Indirect Effect:}\quad IE(\pi_1,\pi_2) = E[Y_i(0,\pi_1) - Y_i(0,\pi_2)]$$
+
+where $\pi$ is the group-level treatment allocation probability.
+
+### 2.2 Aronow & Samii (2017): Exposure Mappings
+
+Aronow & Samii relax partial interference entirely via an **exposure mapping** $f_i(\mathbf{d})$ that summarizes how the full assignment vector affects unit $i$. In this setting:
+
+$$f_i(\mathbf{d}) = \left(D_i,\ \frac{\sum_{j \in \mathcal{N}_i} d_j \cdot \mathbb{1}[j \in \text{round 1}]}{|\mathcal{N}_i|}\right) \equiv \left(D_i,\ \texttt{network\_rate\_preintensive}_i\right)$$
+
+This is the two-dimensional exposure we just constructed: own treatment and the share of named friends who received a first-round intensive session.
+
+### 2.3 The Main Regression (Equation 3 from the Paper)
+
+The paper's primary regression is:
+
+$$Takeup_{ij} = \tau_0 + \tau_1\, \texttt{network\_rate\_preintensive}_{ij} + \tau_2 X_{ij} + \tau_3\, \texttt{network\_obs}_{ij} + \eta_j + \varepsilon_{ij}$$
+
+- Estimated on the **second-round, no-info subsample** (`delay == 1 & info_none == 1`)
+- $\tau_1$ is the causal spillover: having more friends in intensive round-1 sessions raises own take-up, even without direct information in round 2
+- The slides flag that **linearity in the share** is a strong functional form assumption
+
+**Discussion Question**: Linearity means each additional friend in an intensive session has the same marginal effect, regardless of how many friends are already treated. Is this plausible? We test this with count dummies in Part 3.3.
+
+
+## Part 3: Estimating Direct and Spillover Effects
+
+### 3.1 Direct Effect of Intensive Session (Table 2, Column 1)
+
+```{r direct-effect}
+df_round1 <- df |> filter(delay == 0)
+
+m1 <- feols(takeup_survey ~ intensive, data = df_round1)
+m2 <- feols(takeup_survey ~ intensive | village, data = df_round1)
+m3 <- feols(takeup_survey ~ intensive + male + age + agpop +
+              ricearea_2010 + literacy | village,
+            data = df_round1, cluster = ~address)
+m4 <- feols(takeup_survey ~ intensive + default + male + age + agpop +
+              ricearea_2010 + literacy | village,
+            data = df_round1, cluster = ~address)
+
+modelsummary(
+  list("(1) OLS" = m1, "(2) Village FE" = m2,
+       "(3) FE + Controls" = m3, "(4) + Default" = m4),
+  stars = c('*' = .1, '**' = .05, '***' = .01),
+  gof_map = c("nobs", "r.squared", "FE: village"),
+  coef_rename = c("intensive"     = "Intensive Session",
+                  "default"       = "Default = Buy",
+                  "age"           = "Age",
+                  "agpop"         = "HH Size",
+                  "male"          = "Male HH Head",
+                  "literacy"      = "Literate",
+                  "ricearea_2010" = "Rice Area (mu)"),
+  title = "Table 2 (col 1): Direct Effect of Intensive Session on Take-up"
+)
+```
+
+**Discussion Question**: Why include village fixed effects in an individually randomized experiment? What does it gain in precision, and does it change the interpretation of the coefficient?
+
+### 3.2 Spillover Effects via `network_rate_preintensive` (Table 2, Columns 2–3)
+
+```{r spillover-network}
+df_noinfo <- df |> filter(delay == 1, info_none == 1)
+
+s1 <- feols(
+  takeup_survey ~ network_rate_preintensive + male + age + agpop +
+    ricearea_2010 + literacy + intensive + risk_averse + disaster_prob +
+    friend1 + friend2 + friend3 + friend4 + friend5 | village,
+  data = df_noinfo, cluster = ~address
+)
+
+s2 <- feols(
+  takeup_survey ~ network_rate_preintensive + network_rate_presimple +
+    intensive + friend1 + friend2 + friend3 + friend4 + friend5 | village,
+  data = df_noinfo, cluster = ~address
+)
+
+modelsummary(
+  list("(2) Network + Controls" = s1,
+       "(3) Intensive vs. Simple Network" = s2),
+  stars = c('*' = .1, '**' = .05, '***' = .01),
+  gof_map = c("nobs", "r.squared", "FE: village"),
+  coef_rename = c(
+    "network_rate_preintensive" = "Network (Share Friends Intensive, Rd1)",
+    "network_rate_presimple"    = "Network (Share Friends Simple, Rd1)",
+    "intensive"                 = "Intensive Session (Own)",
+    "risk_averse"               = "Risk Averse",
+    "disaster_prob"             = "Disaster Prob.",
+    "age" = "Age", "agpop" = "HH Size",
+    "male" = "Male HH Head", "literacy" = "Literate",
+    "ricearea_2010" = "Rice Area (mu)"
+  ),
+  title = "Table 2 (cols 2-3): Spillover Effect of Friends' Intensive Treatment"
+)
+```
+
+**Key result**: $\hat{\tau}_1 > 0$ and statistically significant — having more friends in intensive first-round sessions raises own take-up, even for households who received *no* information in round 2. Column (3) shows that the simple-session network coefficient is near zero, pointing to information content (not mere social contact) as the mechanism.
+
+### 3.3 Non-Linear Spillover: Count Dummy Specification (Table 2, Column 4)
+
+```{r nonlinear-spillover}
+df_noinfo <- df_noinfo |>
+  mutate(
+    inter_network_educ1 = network_onlyone * intensive,
+    inter_network_educ2 = network_onlytwo * intensive,
+    inter_network_educ3 = network_twomore * intensive
+  )
+
+s3 <- feols(
+  takeup_survey ~
+    network_onlyone + network_onlytwo + network_twomore + intensive +
+    inter_network_educ1 + inter_network_educ2 + inter_network_educ3 +
+    male + age + agpop + ricearea_2010 + literacy +
+    risk_averse + disaster_prob +
+    friend1 + friend2 + friend3 + friend4 + friend5 | village,
+  data = df_noinfo, cluster = ~address
+)
+
+modelsummary(
+  list("(4) Count Dummies" = s3),
+  stars = c('*' = .1, '**' = .05, '***' = .01),
+  gof_map = c("nobs", "r.squared"),
+  coef_rename = c(
+    "network_onlyone"     = "Exactly 1 Friend Intensive",
+    "network_onlytwo"     = "Exactly 2 Friends Intensive",
+    "network_twomore"     = "2+ Friends Intensive",
+    "intensive"           = "Intensive Session (Own)",
+    "inter_network_educ1" = "Own Intensive × 1 Friend",
+    "inter_network_educ2" = "Own Intensive × 2 Friends",
+    "inter_network_educ3" = "Own Intensive × 2+ Friends"
+  ),
+  title = "Table 2 (col 4): Non-Linear Spillover — Count Specification"
+)
+```
+
+
+## Part 4: Mechanisms
+
+
+### 4.1 Default Options as Exogenous Variation (Table 6)
+
+The village-level **default option** (`default = 1` in Type IA villages) creates exogenous variation in first-round take-up *independent of information content*. This allows separating the purchase-imitation mechanism from knowledge diffusion.
+
+```{r default-mechanism}
+# Village-level first-round take-up rate
+df <- df |>
+  group_by(address) |>
+  mutate(
+    pre_takeup_rate = mean(takeup_survey[delay == 0], na.rm = TRUE)
+  ) |>
+  ungroup() |>
+  mutate(inter_pre_none    = pre_takeup_rate * info_none,
+         inter_pre_none_iv = default         * info_none)
+
+# OLS
+m_default1 <- feols(
+  takeup_survey ~ pre_takeup_rate + info_none + inter_pre_none +
+    male + age + agpop + ricearea_2010 + literacy +
+    intensive + risk_averse + disaster_prob | village,
+  data = df |> filter(delay == 1), cluster = ~address
+)
+
+# Reduced form (default as instrument)
+m_default2 <- feols(
+  takeup_survey ~ default + info_none + inter_pre_none_iv +
+    male + age + agpop + ricearea_2010 + literacy +
+    intensive + risk_averse + disaster_prob | village,
+  data = df |> filter(delay == 1), cluster = ~address
+)
+
+modelsummary(
+  list("OLS" = m_default1, "Reduced Form (Default IV)" = m_default2),
+  stars = c('*' = .1, '**' = .05, '***' = .01),
+  gof_map = c("nobs", "r.squared"),
+  coef_rename = c(
+    "pre_takeup_rate"   = "First-Round Take-up Rate",
+    "default"           = "Default = Buy",
+    "info_none"         = "No Info Given (2nd Round)",
+    "inter_pre_none"    = "Take-up Rate × No Info",
+    "inter_pre_none_iv" = "Default × No Info",
+    "intensive"         = "Intensive Session"
+  ),
+  title = "Table 6: Effect of First-Round Take-up on Second-Round Take-up"
+)
+```
+
+**Key result**: First-round take-up rate raises second-round take-up only when it is **revealed** (`info_none == 0`). When no information about others' take-up is given, the effect disappears. This confirms that purchase imitation operates *conditionally on visibility*, while knowledge diffusion is the primary unconditional mechanism.
+
+
+## Part 5: Heterogeneity by Network Structure
+
+The paper examines whether the spillover effect varies with network position. The slides (Bračulj, slide 13) highlight three structural measures computed via UCINET:
+
+- **In-degree** (`indegree`): number of households who *named* this household as a friend
+- **Path length** (`path_out_ind`): mean shortest path distance from this household to others
+- **Eigenvector centrality** (`eigenvector`): importance in the overall information flow
+
+**Critical caveat from the slides**: Network characteristics are **endogenous** — these heterogeneity results are descriptive, not causal.
+
+```{r network-structure-heterogeneity}
+df_noinfo <- df |>
+  filter(delay == 1, info_none == 1) |>
+  mutate(
+    inter_net_indegree         = indegree         * network_rate_preintensive,
+    inter_net_pathin           = path_in_ind      * network_rate_preintensive,
+    inter_net_eigenvector      = eigenvector      * network_rate_preintensive,
+    inter_net_educindegree     = mean_1steduc_indegree     * network_rate_preintensive,
+    inter_net_educpathout      = mean_1steduc_path_out_ind * network_rate_preintensive,
+    inter_net_educeigenvector  = mean_1steduc_eigenvector  * network_rate_preintensive,
+    inter_net_allindegree      = mean_allnetindegree       * network_rate_preintensive,
+    inter_net_alleigenvector   = mean_allneteigenvector    * network_rate_preintensive
+  )
+
+# 1) In-degree
+m_deg <- feols(
+  takeup_survey ~ network_rate_preintensive +
+    mean_1steduc_indegree + inter_net_educindegree +
+    indegree + inter_net_indegree +
+    mean_allnetindegree + mean_allnetpath_out_ind + inter_net_allindegree +
+    mean_allneteigenvector +
+    male + age + agpop + ricearea_2010 + literacy + intensive | village,
+  data = df_noinfo, cluster = ~address
+)
+
+# 2) Eigenvector centrality
+m_eig <- feols(
+  takeup_survey ~ network_rate_preintensive +
+    mean_1steduc_eigenvector + inter_net_educeigenvector +
+    eigenvector + inter_net_eigenvector +
+    mean_allnetindegree + mean_allnetpath_out_ind +
+    mean_allneteigenvector + inter_net_alleigenvector +
+    male + age + agpop + ricearea_2010 + literacy + intensive | village,
+  data = df_noinfo, cluster = ~address
+)
+
+modelsummary(
+  list("(1) In-Degree" = m_deg, "(3) Eigenvector" = m_eig),
+  stars = c('*' = .1, '**' = .05, '***' = .01),
+  gof_map = c("nobs", "r.squared"),
+  coef_rename = c(
+    "network_rate_preintensive"  = "Network (Share Intensive)",
+    "indegree"                   = "Own In-Degree",
+    "inter_net_indegree"         = "Network × Own In-Degree",
+    "mean_1steduc_indegree"      = "Friends' Avg In-Degree",
+    "inter_net_educindegree"     = "Network × Friends' In-Degree",
+    "eigenvector"                = "Own Eigenvector Centrality",
+    "inter_net_eigenvector"      = "Network × Own Eigenvector",
+    "mean_1steduc_eigenvector"   = "Friends' Avg Eigenvector",
+    "inter_net_educeigenvector"  = "Network × Friends' Eigenvector"
+  ),
+  title = "Table 8: Heterogeneity of Spillover by Network Structure"
+)
+```
+
+**Key result**: High in-degree is associated with *weaker* indirect effects. Households with many incoming nominations are already well-informed — an additional friend in an intensive session adds less marginal information.
+
+**Discussion Question**: How would you design an experiment to estimate the *causal* effect of network centrality on spillover susceptibility? What would you need to randomly vary?
+
+
+## Part 6: Simulation — What Happens If We Impose SUTVA?
+
+```{r simulation}
+set.seed(42)
+n_villages <- 50; n_per_village <- 30; n <- n_villages * n_per_village
+
+sim_data <- data.frame(
+  village = rep(1:n_villages, each = n_per_village),
+  id      = 1:n,
+  treated = rbinom(n, 1, 0.5)
+)
+
+sim_data <- sim_data |>
+  group_by(village) |>
+  mutate(frac_treated_peers = (sum(treated) - treated) / (n_per_village - 1)) |>
+  ungroup()
+
+beta_direct    <- 0.15
+beta_spillover <- 0.20
+sim_data$y <- 0.3 + beta_direct * sim_data$treated +
+  beta_spillover * sim_data$frac_treated_peers + rnorm(n, 0, 0.3)
+sim_data$y <- pmax(0, pmin(1, sim_data$y))
+
+naive    <- feols(y ~ treated, data = sim_data)
+correct  <- feols(y ~ treated + frac_treated_peers, data = sim_data)
+fe_model <- feols(y ~ treated | village, data = sim_data)
+
+modelsummary(
+  list("Naive (SUTVA imposed)"         = naive,
+       "Correct (spillover controlled)" = correct,
+       "Village FE only"               = fe_model),
+  stars = c('*' = .1, '**' = .05, '***' = .01),
+  gof_map = c("nobs", "r.squared"),
+  coef_rename = c("treated"            = "Own Treatment",
+                  "frac_treated_peers" = "Frac. Treated Peers"),
+  title = "Simulation: Bias from Ignoring Spillovers"
+)
+```
+
+The naive estimator confounds direct and indirect effects. Village FE partially absorbs spillovers but does not cleanly recover the true direct effect.
+
+### 6.1 Monte Carlo: Distribution of the Bias
+
+```{r monte-carlo}
+n_sims <- 500
+results <- data.frame(naive = numeric(n_sims),
+                      correct = numeric(n_sims),
+                      fe = numeric(n_sims))
+
+for (s in 1:n_sims) {
+  sim_data$treated <- rbinom(n, 1, 0.5)
+  sim_data <- sim_data |>
+    group_by(village) |>
+    mutate(frac_treated_peers = (sum(treated) - treated) / (n_per_village - 1)) |>
+    ungroup()
+  sim_data$y <- 0.3 + beta_direct * sim_data$treated +
+    beta_spillover * sim_data$frac_treated_peers + rnorm(n, 0, 0.3)
+
+  results$naive[s]   <- coef(feols(y ~ treated, data = sim_data))["treated"]
+  results$correct[s] <- coef(feols(y ~ treated + frac_treated_peers,
+                                   data = sim_data))["treated"]
+  results$fe[s]      <- coef(feols(y ~ treated | village, data = sim_data))["treated"]
+}
+
+results_long <- pivot_longer(results, everything(),
+                             names_to = "Estimator", values_to = "Estimate") |>
+  mutate(Estimator = factor(Estimator,
+                            levels = c("naive", "correct", "fe"),
+                            labels = c("Naive (SUTVA)", "Correct", "Village FE")))
+
+ggplot(results_long, aes(x = Estimate, fill = Estimator)) +
+  geom_density(alpha = 0.5) +
+  geom_vline(xintercept = beta_direct, linetype = "dashed", linewidth = 1) +
+  scale_fill_manual(values = c("Naive (SUTVA)" = "#d7191c",
+                               "Correct"       = "#2c7bb6",
+                               "Village FE"    = "#fdae61")) +
+  labs(x = "Estimated Direct Treatment Effect", y = "Density",
+       title = "Monte Carlo: Bias from Ignoring Spillovers",
+       subtitle = paste0("500 simulations | True direct = ", beta_direct,
+                         " | True spillover = ", beta_spillover)) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+```
+
+
+## Part 7: Randomization Inference for Spillover Detection
+
+Following **Aronow (2012)**, we test the sharp null of *no interference* by permuting the network exposure variable within villages.
+
+```{r ri-spillover}
+set.seed(123)
+
+df_ri <- df |>
+  filter(delay == 1, info_none == 1) |>
+  filter(!is.na(network_rate_preintensive) & !is.na(takeup_survey) &
+           !is.na(network_obs) & !is.na(age) & !is.na(agpop) &
+           !is.na(male) & !is.na(literacy) & !is.na(risk_averse))
+
+obs_model <- lm(takeup_survey ~ network_rate_preintensive + network_obs +
+                  age + agpop + male + literacy + risk_averse,
+                data = df_ri)
+obs_stat <- coef(obs_model)["network_rate_preintensive"]
+
+n_perms <- 1000
+perm_stats <- numeric(n_perms)
+
+for (p in 1:n_perms) {
+  df_perm <- df_ri |>
+    group_by(village) |>
+    mutate(network_perm = sample(network_rate_preintensive)) |>
+    ungroup()
+  perm_model <- lm(takeup_survey ~ network_perm + network_obs +
+                     age + agpop + male + literacy + risk_averse,
+                   data = df_perm)
+  perm_stats[p] <- coef(perm_model)["network_perm"]
+}
+
+ri_pvalue <- mean(abs(perm_stats) >= abs(obs_stat))
+cat("Observed network coefficient:", round(obs_stat, 4), "\n")
+cat("RI p-value:", round(ri_pvalue, 3), "\n")
+```
+
+```{r ri-plot}
+ggplot(data.frame(stat = perm_stats), aes(x = stat)) +
+  geom_histogram(bins = 40, fill = "grey70", color = "white") +
+  geom_vline(xintercept = obs_stat, color = "#d7191c",
+             linewidth = 1.2, linetype = "dashed") +
+  annotate("text", x = obs_stat, y = Inf, vjust = 2, hjust = -0.1,
+           label = paste0("Observed\n(p = ", round(ri_pvalue, 3), ")"),
+           color = "#d7191c", size = 3.5) +
+  labs(x = "Permuted Network Coefficient", y = "Count",
+       title = "Randomization Inference: Testing for Spillover Effects",
+       subtitle = paste0("1,000 permutations | RI p-value = ",
+                         round(ri_pvalue, 3))) +
+  theme_minimal(base_size = 14)
+```
+
+
+## Part 8: Further Questions
+
+1. **Partial vs. general interference**: The paper assumes interference operates only within villages. What would threaten this? How does Wang (2021) extend the framework to handle *spatial* interference where group boundaries are unknown?
+
+2. **Exposure mapping choices**: The paper uses the *share* of named friends in intensive round-1 sessions. What are the trade-offs with alternative specifications: binary ("any friend treated"), count, or inverse-distance weighted? How does misspecifying the mapping bias estimates?
+
+3. **Linearity of the network effect**: Using the count-dummy specification from Part 3.3, can you detect nonlinearity? Do effects saturate once 2+ friends are treated?
+
+4. **Endogeneity of network characteristics**: The slides explicitly note heterogeneity by in-degree, path length, and eigenvector centrality is *not causal* because network structure is endogenous. What unobservable household characteristics might simultaneously determine centrality and spillover susceptibility?
+
+5. **Wang et al. (forthcoming) on unknown interference**: In spatial experiments, researchers often do not know the network structure. How does the design-based approach handle estimation and inference without correctly specifying the exposure mapping? What is the efficiency cost of this robustness?
+
+
+## References
+
+- Aronow, P. M. (2012). A general method for detecting interference between units in randomized experiments. *Sociological Methods & Research*, 41(1), 3--16.
+- Aronow, P. M. & Samii, C. (2017). Estimating average causal effects under general interference. *Annals of Applied Statistics*, 11(4), 1912--1947.
+- Cai, J., De Janvry, A. & Sadoulet, E. (2015). Social networks and the decision to insure. *AEJ: Applied Economics*, 7(2), 81--108.
+- Hudgens, M. G. & Halloran, M. E. (2008). Toward causal inference with interference. *Journal of the American Statistical Association*, 103(482), 832--842.
+- Wang, Y. (2021). Causal inference under temporal and spatial interference. *arXiv:2106.15074*.
+- Wang, Y., Samii, C., Chang, H. & Aronow, P. M. (forthcoming). Design-based inference for spatial experiments under unknown interference. *Annals of Applied Statistics*.
